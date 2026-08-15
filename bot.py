@@ -18,6 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     Message,
     TelegramObject,
@@ -40,6 +41,7 @@ if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN не настроен в .env")
 if ADMIN_ID <= 0: raise RuntimeError("ADMIN_ID не настроен.")
 
 DB_NAME = os.getenv("DB_NAME", "dating_bot.db")
+RULES_VERSION = 1
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,7 +66,7 @@ MAX_REPORT_LENGTH = 500
 VALID_GENDERS = {"male": "Парень", "female": "Девушка"}
 VALID_SEARCH_GENDERS = {"male": "Парней", "female": "Девушек", "all": "Всех"}
 VALID_MODES = {"local", "global", "likes"}
-ALLOWED_USER_FIELDS = {"name", "age", "gender", "search_gender", "city", "bio", "photo_id", "username"}
+ALLOWED_USER_FIELDS = {"name", "age", "gender", "search_gender", "city", "bio", "photo_id", "username", "is_active"}
 
 class LikeResult(Enum):
     LIKED = 1
@@ -107,8 +109,19 @@ class Report(StatesGroup):
     reason = State()
 
 # ============================================================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ И ТРАНЗАКЦИИ
 # ============================================================
+@asynccontextmanager
+async def transaction():
+    async with db_lock:
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            yield
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
 async def init_db() -> None:
     global db
     db = await aiosqlite.connect(DB_NAME)
@@ -123,7 +136,8 @@ async def init_db() -> None:
         gender TEXT NOT NULL CHECK(gender IN ('Парень', 'Девушка')),
         search_gender TEXT NOT NULL CHECK(search_gender IN ('Парней', 'Девушек', 'Всех')),
         city TEXT NOT NULL, bio TEXT NOT NULL, photo_id TEXT NOT NULL, username TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP, accepted_rules_at DATETIME)""")
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP, accepted_rules_at DATETIME,
+        is_active INTEGER NOT NULL DEFAULT 1, accepted_rules_version INTEGER)""")
 
     await db.execute("""CREATE TABLE IF NOT EXISTS views (
         viewer_id INTEGER NOT NULL, viewed_id INTEGER NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -146,6 +160,9 @@ async def init_db() -> None:
     await db.execute("""CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT, reporter_id INTEGER NOT NULL, reported_id INTEGER NOT NULL,
         reason TEXT NOT NULL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+        reviewed_by INTEGER, reviewed_at DATETIME, resolution TEXT,
+        CHECK(reporter_id != reported_id),
         FOREIGN KEY (reporter_id) REFERENCES users(user_id) ON DELETE CASCADE,
         FOREIGN KEY (reported_id) REFERENCES users(user_id) ON DELETE CASCADE)""")
 
@@ -161,9 +178,38 @@ async def init_db() -> None:
     await db.execute("CREATE INDEX IF NOT EXISTS idx_users_gender_city ON users(gender, city)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_likes_liked ON likes(liked_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id)")
-    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_unique ON reports(reporter_id, reported_id)")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique ON reports(reporter_id, reported_id) WHERE status = 'pending'")
     await db.commit()
+    
+    await migrate_db()
     logger.info("База данных успешно инициализирована.")
+
+async def migrate_db():
+    async with db.execute("PRAGMA user_version") as cursor:
+        version = (await cursor.fetchone())[0]
+        
+    if version < 1:
+        async with db.execute("PRAGMA table_info(reports)") as cursor:
+            columns = [row[1] for row in await cursor.fetchall()]
+        if "status" not in columns:
+            await db.execute("ALTER TABLE reports ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+            await db.execute("ALTER TABLE reports ADD COLUMN reviewed_by INTEGER")
+            await db.execute("ALTER TABLE reports ADD COLUMN reviewed_at DATETIME")
+            await db.execute("ALTER TABLE reports ADD COLUMN resolution TEXT")
+        await db.execute("DROP INDEX IF EXISTS idx_reports_unique")
+        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique ON reports(reporter_id, reported_id) WHERE status = 'pending'")
+        await db.execute("PRAGMA user_version = 1")
+        
+    if version < 2:
+        async with db.execute("PRAGMA table_info(users)") as cursor:
+            columns = [row[1] for row in await cursor.fetchall()]
+        if "is_active" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        if "accepted_rules_version" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN accepted_rules_version INTEGER")
+        await db.execute("PRAGMA user_version = 2")
+        
+    await db.commit()
 
 async def check_ban(user_id: int) -> bool:
     async with db.execute("SELECT 1 FROM bans WHERE user_id = ?", (user_id,)) as cursor:
@@ -174,14 +220,13 @@ async def get_user(user_id: int) -> Optional[aiosqlite.Row]:
         return await cursor.fetchone()
 
 async def add_user_to_db(user_id: int, name: str, age: int, gender: str, search_gender: str, city: str, bio: str, photo_id: str, username: Optional[str], accepted_rules_at: str) -> None:
-    async with db_lock:
-        await db.execute("""INSERT INTO users (user_id, name, age, gender, search_gender, city, bio, photo_id, username, accepted_rules_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    async with transaction():
+        await db.execute("""INSERT INTO users (user_id, name, age, gender, search_gender, city, bio, photo_id, username, accepted_rules_at, is_active, accepted_rules_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
             ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, age=excluded.age, gender=excluded.gender,
             search_gender=excluded.search_gender, city=excluded.city, bio=excluded.bio, photo_id=excluded.photo_id,
-            username=excluded.username, accepted_rules_at=excluded.accepted_rules_at""",
-            (user_id, name, age, gender, search_gender, city, bio, photo_id, username, accepted_rules_at))
-        await db.commit()
+            username=excluded.username, accepted_rules_at=excluded.accepted_rules_at, is_active=1, accepted_rules_version=excluded.accepted_rules_version""",
+            (user_id, name, age, gender, search_gender, city, bio, photo_id, username, accepted_rules_at, RULES_VERSION))
 
 async def update_user_field(user_id: int, field: str, value: Any) -> None:
     if field not in ALLOWED_USER_FIELDS: raise ValueError(f"Недопустимое поле: {field}")
@@ -189,22 +234,17 @@ async def update_user_field(user_id: int, field: str, value: Any) -> None:
         await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
         await db.commit()
 
+# ИСПРАВЛЕНО: Не удаляем бан при удалении анкеты
 async def delete_user(user_id: int) -> None:
-    async with db_lock:
-        try:
-            await db.execute("BEGIN IMMEDIATE")
-            await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-            await db.execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
-            await db.commit()
-        except:
-            await db.rollback(); raise
+    async with transaction():
+        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
 async def get_likes_count(user_id: int) -> int:
     async with db.execute("""SELECT COUNT(*) FROM likes AS l JOIN users AS u ON u.user_id = l.liker_id
         WHERE l.liked_id = ? AND l.liker_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?)
         AND l.liker_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
         AND l.liker_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
-        AND l.liker_id NOT IN (SELECT user_id FROM bans)""", (user_id, user_id, user_id, user_id)) as cursor:
+        AND l.liker_id NOT IN (SELECT user_id FROM bans) AND u.is_active = 1""", (user_id, user_id, user_id, user_id)) as cursor:
         return (await cursor.fetchone())[0]
 
 async def are_users_blocked(u1: int, u2: int) -> bool:
@@ -217,61 +257,49 @@ async def add_view(viewer_id: int, viewed_id: int) -> None:
         await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (viewer_id, viewed_id))
         await db.commit()
 
+# ИСПРАВЛЕНО: Lifecycle лайков
 async def add_like(liker_id: int, liked_id: int) -> LikeResult:
     if liker_id == liked_id: return LikeResult.REJECTED
     u1, u2 = min(liker_id, liked_id), max(liker_id, liked_id)
     
-    async with db_lock:
-        try:
-            await db.execute("BEGIN IMMEDIATE")
-            
-            # Проверка бана и блокировки внутри транзакции
-            async with db.execute("SELECT 1 FROM bans WHERE user_id IN (?, ?) LIMIT 1", (liker_id, liked_id)) as cur:
-                if await cur.fetchone(): await db.rollback(); return LikeResult.REJECTED
-            async with db.execute("SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)", (liker_id, liked_id, liked_id, liker_id)) as cur:
-                if await cur.fetchone(): await db.rollback(); return LikeResult.REJECTED
+    async with transaction():
+        async with db.execute("SELECT 1 FROM bans WHERE user_id IN (?, ?) LIMIT 1", (liker_id, liked_id)) as cur:
+            if await cur.fetchone(): return LikeResult.REJECTED
+        async with db.execute("SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)", (liker_id, liked_id, liked_id, liker_id)) as cur:
+            if await cur.fetchone(): return LikeResult.REJECTED
 
-            await db.execute("INSERT OR IGNORE INTO likes (liker_id, liked_id) VALUES (?, ?)", (liker_id, liked_id))
-            await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (liker_id, liked_id))
-            
-            async with db.execute("SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?", (liked_id, liker_id)) as cur:
-                mutual = await cur.fetchone() is not None
+        await db.execute("INSERT OR IGNORE INTO likes (liker_id, liked_id) VALUES (?, ?)", (liker_id, liked_id))
+        await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (liker_id, liked_id))
+        
+        async with db.execute("SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?", (liked_id, liker_id)) as cur:
+            mutual = await cur.fetchone() is not None
 
-            if not mutual:
-                await db.commit(); return LikeResult.LIKED
+        if not mutual:
+            return LikeResult.LIKED
 
-            cursor = await db.execute("INSERT OR IGNORE INTO matches (user1_id, user2_id) VALUES (?, ?)", (u1, u2))
-            await db.commit()
-            return LikeResult.MATCHED if cursor.rowcount > 0 else LikeResult.LIKED
-        except:
-            await db.rollback(); raise
+        # Взаимный мэтч: удаляем лайки, добавляем просмотры, создаем мэтч
+        await db.execute("DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)", (liker_id, liked_id, liked_id, liker_id))
+        await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (liked_id, liker_id))
+        
+        cursor = await db.execute("INSERT OR IGNORE INTO matches (user1_id, user2_id) VALUES (?, ?)", (u1, u2))
+        return LikeResult.MATCHED if cursor.rowcount > 0 else LikeResult.LIKED
 
 async def reject_like(user_id: int, liker_id: int) -> None:
-    async with db_lock:
-        try:
-            await db.execute("BEGIN IMMEDIATE")
-            await db.execute("DELETE FROM likes WHERE liker_id = ? AND liked_id = ?", (liker_id, user_id))
-            await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (user_id, liker_id))
-            await db.commit()
-        except:
-            await db.rollback(); raise
+    async with transaction():
+        await db.execute("DELETE FROM likes WHERE liker_id = ? AND liked_id = ?", (liker_id, user_id))
+        await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (user_id, liker_id))
 
 async def block_user(blocker_id: int, blocked_id: int) -> None:
     if blocker_id == blocked_id: return
     u1, u2 = min(blocker_id, blocked_id), max(blocker_id, blocked_id)
-    async with db_lock:
-        try:
-            await db.execute("BEGIN IMMEDIATE")
-            await db.execute("INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)", (blocker_id, blocked_id))
-            await db.execute("DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)", (blocker_id, blocked_id, blocked_id, blocker_id))
-            await db.execute("DELETE FROM matches WHERE user1_id=? AND user2_id=?", (u1, u2))
-            await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (blocker_id, blocked_id))
-            await db.commit()
-        except:
-            await db.rollback(); raise
+    async with transaction():
+        await db.execute("INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)", (blocker_id, blocked_id))
+        await db.execute("DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)", (blocker_id, blocked_id, blocked_id, blocker_id))
+        await db.execute("DELETE FROM matches WHERE user1_id=? AND user2_id=?", (u1, u2))
+        await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (blocker_id, blocked_id))
 
 async def report_exists(reporter_id: int, reported_id: int) -> bool:
-    async with db.execute("SELECT 1 FROM reports WHERE reporter_id=? AND reported_id=? LIMIT 1", (reporter_id, reported_id)) as cur:
+    async with db.execute("SELECT 1 FROM reports WHERE reporter_id=? AND reported_id=? AND status='pending' LIMIT 1", (reporter_id, reported_id)) as cur:
         return await cur.fetchone() is not None
 
 async def add_report(reporter_id: int, reported_id: int, reason: str) -> Optional[int]:
@@ -280,34 +308,58 @@ async def add_report(reporter_id: int, reported_id: int, reason: str) -> Optiona
         await db.commit()
         return cursor.lastrowid if cursor.rowcount > 0 else None
 
-async def ban_user(user_id: int, reason: str) -> None:
-    async with db_lock:
-        try:
-            await db.execute("BEGIN IMMEDIATE")
-            await db.execute("INSERT INTO bans (user_id, reason) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason", (user_id, reason))
-            await db.execute("DELETE FROM likes WHERE liker_id=? OR liked_id=?", (user_id, user_id))
-            await db.execute("DELETE FROM matches WHERE user1_id=? OR user2_id=?", (user_id, user_id))
-            await db.commit()
-        except:
-            await db.rollback(); raise
+async def ban_user(user_id: int, reason: str, admin_id: Optional[int] = None, report_id: Optional[int] = None) -> None:
+    async with transaction():
+        await db.execute("INSERT INTO bans (user_id, reason) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason", (user_id, reason))
+        await db.execute("DELETE FROM likes WHERE liker_id=? OR liked_id=?", (user_id, user_id))
+        await db.execute("DELETE FROM matches WHERE user1_id=? OR user2_id=?", (user_id, user_id))
+        if admin_id and report_id:
+            await db.execute("UPDATE reports SET status = 'accepted', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (admin_id, report_id))
 
-async def get_random_profile(user_id: int, search_gender: str, search_city: Optional[str] = None) -> Optional[aiosqlite.Row]:
-    query = """SELECT * FROM users WHERE user_id != ? AND user_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?)
-        AND user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?) AND user_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+# ИСПРАВЛЕНО: Учет взаимных предпочтений
+async def get_random_profile(user_id: int, user_gender: str, search_gender: str, user_city: Optional[str] = None, strict_city: bool = False) -> Optional[aiosqlite.Row]:
+    query = """SELECT * FROM users 
+        WHERE user_id != ? AND is_active = 1
+        AND user_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?)
+        AND user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?) 
+        AND user_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
         AND user_id NOT IN (SELECT user_id FROM bans)"""
     params = [user_id, user_id, user_id, user_id]
+    
     if search_gender != "Всех":
         g_filter = {"Парней": "Парень", "Девушек": "Девушка"}.get(search_gender)
-        if g_filter: query += " AND gender = ?"; params.append(g_filter)
-    if search_city: query += " AND lower(city) = lower(?)"; params.append(search_city)
-    query += " ORDER BY RANDOM() LIMIT 1"
-    async with db.execute(query, tuple(params)) as cursor: return await cursor.fetchone()
+        if g_filter: 
+            query += " AND gender = ?"
+            params.append(g_filter)
+            
+    query += """ AND (
+        search_gender = 'Всех'
+        OR (search_gender = 'Парней' AND ? = 'Парень')
+        OR (search_gender = 'Девушек' AND ? = 'Девушка')
+    )"""
+    params.extend([user_gender, user_gender])
+            
+    if strict_city:
+        if user_city:
+            query += " AND lower(city) = lower(?)"
+            params.append(user_city)
+        query += " ORDER BY RANDOM() LIMIT 1"
+    else:
+        if user_city:
+            query += " ORDER BY CASE WHEN lower(city) = lower(?) THEN 0 ELSE 1 END, RANDOM() LIMIT 1"
+            params.append(user_city)
+        else:
+            query += " ORDER BY RANDOM() LIMIT 1"
+            
+    async with db.execute(query, tuple(params)) as cursor: 
+        return await cursor.fetchone()
 
 async def get_next_liker(user_id: int) -> Optional[aiosqlite.Row]:
     async with db.execute("""SELECT u.* FROM users AS u JOIN likes AS l ON u.user_id = l.liker_id WHERE l.liked_id = ?
         AND u.user_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?) AND u.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
-        AND u.user_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?) AND u.user_id NOT IN (SELECT user_id FROM bans)
-        ORDER BY l.created_at DESC LIMIT 1""", (user_id, user_id, user_id, user_id)) as cursor: return await cursor.fetchone()
+        AND u.user_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?) AND u.user_id NOT IN (SELECT user_id FROM bans) AND u.is_active = 1
+        ORDER BY l.created_at DESC LIMIT 1""", (user_id, user_id, user_id, user_id)) as cursor: 
+        return await cursor.fetchone()
 
 async def verify_like_exists(liker_id: int, liked_id: int) -> bool:
     async with db.execute("SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?", (liker_id, liked_id)) as cur:
@@ -317,7 +369,7 @@ async def verify_like_exists(liker_id: int, liked_id: int) -> bool:
 # MIDDLEWARE
 # ============================================================
 class SecurityMiddleware(BaseMiddleware):
-    def __init__(self, cooldown: float = 1.0):
+    def __init__(self, cooldown: float = 0.5):
         self.last_action = {}
         self.cooldown = cooldown
 
@@ -332,11 +384,13 @@ class SecurityMiddleware(BaseMiddleware):
             elif isinstance(event, CallbackQuery): await event.answer("Вы заблокированы.", show_alert=True)
             return
 
-        if isinstance(event, Message): return await handler(event, data)
+        if isinstance(event, Message) and event.text and event.text.startswith("/"):
+            return await handler(event, data)
 
         now = time.monotonic()
         if now - self.last_action.get(user.id, 0) < self.cooldown:
             if isinstance(event, CallbackQuery): await event.answer("Не так быстро. Подождите немного.")
+            elif isinstance(event, Message): await event.answer("Не так быстро. Подождите немного.")
             return
 
         self.last_action[user.id] = now
@@ -354,52 +408,68 @@ def format_profile(profile: aiosqlite.Row, prefix: str = "") -> str:
     return (f"{prefix}👤 <b>{escape(profile['name'])}</b>, {profile['age']} ({escape(profile['gender'])})\n"
             f"📍 {escape(profile['city'])}\n\n📝 {escape(profile['bio'])}")
 
-async def get_search_context(mode: str, user_id: int) -> Optional[str]:
-    if mode != "local": return None
-    user = await get_user(user_id)
-    return user["city"] if user else None
+async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=None):
+    if callback.message.photo:
+        try: await callback.message.delete()
+        except TelegramBadRequest: pass
+        await callback.message.answer(text, reply_markup=reply_markup)
+    else:
+        try: await callback.message.edit_text(text, reply_markup=reply_markup)
+        except TelegramBadRequest: await callback.message.answer(text, reply_markup=reply_markup)
 
 async def send_menu(message: Message, user_id: int, text: str = "Главное меню:") -> None:
     await message.answer(text, reply_markup=menu_keyboard(await get_likes_count(user_id)))
 
-async def show_profile(callback: CallbackQuery, state: FSMContext, search_city: Optional[str] = None, mode: str = "global") -> None:
+async def show_profile(callback: CallbackQuery, state: FSMContext, mode: str = "global") -> None:
     user = await get_user(callback.from_user.id)
-    if not user: await callback.message.answer("Анкета не найдена. Напишите /start."); return
+    if not user or not user["is_active"]:
+        await safe_edit_or_send(callback, "Ваша анкета неактивна. Обновите фото через 'Моя анкета' -> 'Редактировать'.")
+        return
 
     while True:
-        profile = await get_random_profile(user_id=callback.from_user.id, search_gender=user["search_gender"], search_city=search_city)
+        strict = (mode == "local")
+        profile = await get_random_profile(
+            user_id=callback.from_user.id, 
+            user_gender=user["gender"],
+            search_gender=user["search_gender"], 
+            user_city=user["city"], 
+            strict_city=strict
+        )
         if not profile:
-            await callback.message.answer("Подходящие анкеты закончились. Попробуйте позже!", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id)))
+            await safe_edit_or_send(callback, "Подходящие анкеты закончились. Попробуйте позже!", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id)))
             return
         try:
-            await callback.message.answer_photo(photo=profile["photo_id"], caption=format_profile(profile), reply_markup=profile_keyboard(profile["user_id"], mode))
-            await state.update_data(active_profile_id=profile["user_id"], active_profile_mode=mode)
+            msg = await callback.message.answer_photo(photo=profile["photo_id"], caption=format_profile(profile), reply_markup=profile_keyboard(profile["user_id"], mode))
+            await state.update_data(active_profile_id=profile["user_id"], active_profile_mode=mode, active_profile_msg_id=msg.message_id)
             return
         except TelegramBadRequest as exc:
             if "wrong file identifier" in str(exc).lower() or "PHOTO_INVALID" in str(exc).upper():
-                await add_view(callback.from_user.id, profile["user_id"]); continue
-            await callback.message.answer("Не удалось показать анкету. Попробуйте позже."); return
+                await update_user_field(profile["user_id"], "is_active", 0)
+                continue
+            await safe_edit_or_send(callback, "Не удалось показать анкету. Попробуйте позже.")
+            return
 
 async def show_next_liker(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     while True:
         profile = await get_next_liker(user_id)
         if not profile:
-            await callback.message.answer("Новых лайков нет.", reply_markup=menu_keyboard(await get_likes_count(user_id)))
+            await safe_edit_or_send(callback, "Новых лайков нет.", reply_markup=menu_keyboard(await get_likes_count(user_id)))
             return
         try:
-            await callback.message.answer_photo(photo=profile["photo_id"], caption=format_profile(profile, prefix="💌 <b>Вас оценили!</b>\n\n"), reply_markup=profile_like_keyboard(profile["user_id"]))
-            await state.update_data(active_profile_id=profile["user_id"], active_profile_mode="likes")
+            msg = await callback.message.answer_photo(photo=profile["photo_id"], caption=format_profile(profile, prefix="💌 <b>Вас оценили!</b>\n\n"), reply_markup=profile_like_keyboard(profile["user_id"]))
+            await state.update_data(active_profile_id=profile["user_id"], active_profile_mode="likes", active_profile_msg_id=msg.message_id)
             return
         except TelegramBadRequest as exc:
             if "wrong file identifier" in str(exc).lower() or "PHOTO_INVALID" in str(exc).upper():
-                await add_view(user_id, profile["user_id"]); continue
-            await callback.message.answer("Не удалось показать анкету."); return
+                await update_user_field(profile["user_id"], "is_active", 0)
+                continue
+            await safe_edit_or_send(callback, "Не удалось показать анкету.")
+            return
 
 async def show_next(callback: CallbackQuery, state: FSMContext, mode: str) -> None:
     if mode == "likes": await show_next_liker(callback, state); return
-    search_city = await get_search_context(mode, callback.from_user.id)
-    await show_profile(callback, state, search_city, mode)
+    await show_profile(callback, state, mode)
 
 async def delete_callback_message(callback: CallbackQuery) -> None:
     try: await callback.message.delete()
@@ -424,7 +494,7 @@ def menu_keyboard(likes_count: int = 0):
 
 def search_menu_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="🏢 В моём городе", callback_data="search_local"); builder.button(text="🌍 Везде", callback_data="search_global"); builder.button(text="🔙 В меню", callback_data="menu"); builder.adjust(2, 1); return builder.as_markup()
+    builder.button(text="🏢 Только мой город", callback_data="search_local"); builder.button(text="🌍 Везде (сначала мой город)", callback_data="search_global"); builder.button(text="🔙 В меню", callback_data="menu"); builder.adjust(1, 1, 1); return builder.as_markup()
 
 def profile_keyboard(profile_id: int, mode: str):
     builder = InlineKeyboardBuilder()
@@ -454,14 +524,37 @@ def match_keyboard(target_user_id: int):
     builder = InlineKeyboardBuilder(); builder.button(text="✉️ Написать сообщение", url=f"tg://user?id={target_user_id}"); return builder.as_markup()
 
 def admin_report_keyboard(report_id: int, reported_id: int):
-    builder = InlineKeyboardBuilder(); builder.button(text="🚫 Забанить", callback_data=f"admin_ban:{reported_id}:{report_id}"); return builder.as_markup()
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚫 Забанить", callback_data=f"admin_ban:{reported_id}:{report_id}")
+    builder.button(text="✅ Отклонить", callback_data=f"admin_reject:{report_id}")
+    builder.adjust(2)
+    return builder.as_markup()
 
+# ИСПРАВЛЕНО: Строгая валидация по message_id для всех режимов
 async def validate_active_card(callback: CallbackQuery, state: FSMContext, p_id: int, mode: str) -> bool:
-    if mode == "likes" and not await verify_like_exists(liker_id=p_id, liked_id=callback.from_user.id): return False
-    if mode != "likes":
-        data = await state.get_data()
-        if data.get("active_profile_id") != p_id or data.get("active_profile_mode") != mode: return False
+    data = await state.get_data()
+    if data.get("active_profile_id") != p_id or data.get("active_profile_mode") != mode:
+        return False
+    if data.get("active_profile_msg_id") != callback.message.message_id:
+        return False
+    if mode == "likes" and not await verify_like_exists(liker_id=p_id, liked_id=callback.from_user.id):
+        return False
     return True
+
+# ============================================================
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
+# ============================================================
+@router.errors()
+async def error_handler(event: ErrorEvent):
+    logger.exception("Unhandled exception: %s", event.exception)
+    update = event.update
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("Произошла внутренняя ошибка. Попробуйте позже.", show_alert=True)
+        elif update.message:
+            await update.message.answer("Произошла внутренняя ошибка. Попробуйте позже.")
+    except Exception:
+        pass
 
 # ============================================================
 # РЕГИСТРАЦИЯ
@@ -482,7 +575,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.message(Command("delete"))
 async def cmd_delete(message: Message, state: FSMContext):
     await state.clear(); await delete_user(message.from_user.id)
-    await message.answer("Ваша анкета и все связанные данные, включая записи о блокировке, удалены. Для новой регистрации напишите /start.")
+    await message.answer("Ваша анкета и все связанные с ней данные удалены. Для новой регистрации напишите /start.")
 
 @router.callback_query(Registration.agreement, F.data == "agree_rules")
 async def registration_agreement(callback: CallbackQuery, state: FSMContext):
@@ -545,7 +638,6 @@ async def registration_photo(message: Message, state: FSMContext):
 @router.message(Registration.photo)
 async def registration_photo_invalid(message: Message): await message.answer("Пожалуйста, отправьте изображение именно как фотографию.")
 
-# Text Fallback для FSM
 @router.message(Registration.name, Registration.age, Registration.city, Registration.bio, EditProfile.name, EditProfile.age, EditProfile.city, EditProfile.bio)
 async def text_required_invalid(message: Message): await message.answer("Пожалуйста, отправьте значение текстом.")
 
@@ -554,18 +646,22 @@ async def text_required_invalid(message: Message): await message.answer("Пож�
 # ============================================================
 @router.callback_query(F.data == "search_menu")
 async def search_menu(callback: CallbackQuery):
-    await callback.answer(); await callback.message.edit_text("Где будем искать анкеты?", reply_markup=search_menu_keyboard())
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    if not user or not user["is_active"]:
+        await safe_edit_or_send(callback, "Ваша анкета неактивна. Обновите фото через 'Моя анкета'.")
+        return
+    await safe_edit_or_send(callback, "Где будем искать анкеты?", reply_markup=search_menu_keyboard())
 
 @router.callback_query(F.data == "search_local")
 async def search_local(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    user = await get_user(callback.from_user.id)
-    if not user: await callback.message.answer("Анкета не найдена. Напишите /start."); return
-    await show_profile(callback, state, search_city=user["city"], mode="local")
+    await show_profile(callback, state, mode="local")
 
 @router.callback_query(F.data == "search_global")
 async def search_global(callback: CallbackQuery, state: FSMContext):
-    await callback.answer(); await show_profile(callback, state, search_city=None, mode="global")
+    await callback.answer()
+    await show_profile(callback, state, mode="global")
 
 @router.callback_query(F.data.startswith("like:"))
 async def like_profile(callback: CallbackQuery, state: FSMContext):
@@ -598,9 +694,8 @@ async def like_profile(callback: CallbackQuery, state: FSMContext):
     # MATCHED
     current_user = await get_user(uid)
     if not current_user: return
-    my_un, other_un = current_user["username"], other_user["username"]
-    text_me = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу.\nЛогин партнёра: @{escape(other_un)}" if other_un else f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(other_user['name'])}.\nНаписать можно через кнопку ниже."
-    text_other = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу.\nЛогин партнёра: @{escape(my_un)}" if my_un else f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(current_user['name'])}.\nНаписать можно через кнопку ниже."
+    text_me = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(other_user['name'])}.\nНаписать можно через кнопку ниже."
+    text_other = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(current_user['name'])}.\nНаписать можно через кнопку ниже."
 
     try: await bot.send_message(uid, text_me, reply_markup=match_keyboard(liked_id))
     except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", uid)
@@ -643,7 +738,12 @@ async def block_profile(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "show_likes")
 async def show_likes(callback: CallbackQuery, state: FSMContext):
-    await callback.answer(); await show_next_liker(callback, state)
+    await callback.answer()
+    user = await get_user(callback.from_user.id)
+    if not user or not user["is_active"]:
+        await safe_edit_or_send(callback, "Ваша анкета неактивна.")
+        return
+    await show_next_liker(callback, state)
 
 # ============================================================
 # ЖАЛОБЫ И АДМИН-БАН
@@ -684,16 +784,23 @@ async def process_report(message: Message, state: FSMContext):
     if r_id is None:
         await state.clear(); await message.answer("Вы уже отправляли жалобу на этого пользователя.", reply_markup=menu_keyboard(await get_likes_count(uid))); return
 
-    await add_view(uid, rep_id) # Скрываем анкету от пользователя сразу
+    await add_view(uid, rep_id)
     await message.answer("Жалоба отправлена администрации. Спасибо!", reply_markup=menu_keyboard(await get_likes_count(uid)))
 
     rep_name, rep_un = escape(rep_user["name"]), f"@{escape(rep_user['username'])}" if rep_user["username"] else "нет username"
     text = (f"🚨 <b>Новая жалоба #{r_id}</b>\n\n<b>От кого:</b> {message.from_user.mention_html()} (ID: <code>{uid}</code>)\n"
             f"<b>На кого:</b> {rep_name} (ID: <code>{rep_id}</code>, {rep_un})\n\n<b>Причина:</b>\n{escape(reason)}")
     
-    try: await bot.send_message(ADMIN_ID, text, reply_markup=admin_report_keyboard(r_id, rep_id))
-    except (TelegramBadRequest, TelegramForbiddenError) as e: logger.exception("Fail send report to admin: %s", e)
-    finally: await state.clear()
+    # Отправляем фото админу
+    try:
+        if rep_user["photo_id"]:
+            await bot.send_photo(ADMIN_ID, photo=rep_user["photo_id"], caption=text, reply_markup=admin_report_keyboard(r_id, rep_id))
+        else:
+            await bot.send_message(ADMIN_ID, text, reply_markup=admin_report_keyboard(r_id, rep_id))
+    except (TelegramBadRequest, TelegramForbiddenError) as e: 
+        logger.exception("Fail send report to admin: %s", e)
+    finally: 
+        await state.clear()
 
 @router.message(Report.reason)
 async def report_invalid(message: Message): await message.answer("Отправьте причину жалобы текстом.")
@@ -713,16 +820,31 @@ async def admin_ban_user(callback: CallbackQuery):
         u_id, r_id = int(raw_uid), int(raw_rid)
     except (ValueError, AttributeError): await callback.answer("Некорректные данные.", show_alert=True); return
 
-    async with db.execute("SELECT reported_id FROM reports WHERE id = ?", (r_id,)) as cur:
-        row = await cur.fetchone()
-        if not row or row["reported_id"] != u_id: await callback.answer("Жалоба не найдена или ID не совпадает.", show_alert=True); return
-
-    await ban_user(u_id, f"Бан по жалобе #{r_id}")
-    await callback.answer("Пользователь заблокирован. Лайки и мэтчи удалены.")
-    try: await callback.message.edit_text(f"{callback.message.html_text or callback.message.text}\n\n✅ Пользователь <code>{u_id}</code> забанен.")
-    except TelegramBadRequest: pass
+    await ban_user(u_id, f"Бан по жалобе #{r_id}", callback.from_user.id, r_id)
+    await callback.answer("Пользователь заблокирован. Жалоба закрыта.")
+    try: await callback.message.edit_caption(caption=f"{callback.message.html_text or callback.message.caption}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
+    except TelegramBadRequest: 
+        try: await callback.message.edit_text(f"{callback.message.html_text or callback.message.text}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
+        except TelegramBadRequest: pass
     try: await bot.send_message(u_id, "Вы были заблокированы администрацией. Для удаления данных используйте /delete.")
     except (TelegramBadRequest, TelegramForbiddenError): pass
+
+@router.callback_query(F.data.startswith("admin_reject:"))
+async def admin_reject_report(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: await callback.answer("Недостаточно прав.", show_alert=True); return
+    try:
+        _, r_id = callback.data.split(":")
+        r_id = int(r_id)
+    except (ValueError, AttributeError): await callback.answer("Некорректные данные.", show_alert=True); return
+
+    async with transaction():
+        await db.execute("UPDATE reports SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (callback.from_user.id, r_id))
+    
+    await callback.answer("Жалоба отклонена.")
+    try: await callback.message.edit_caption(caption=f"{callback.message.html_text or callback.message.caption}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
+    except TelegramBadRequest:
+        try: await callback.message.edit_text(f"{callback.message.html_text or callback.message.text}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
+        except TelegramBadRequest: pass
 
 # ============================================================
 # ПРОФИЛЬ И РЕДАКТИРОВАНИЕ
@@ -732,8 +854,10 @@ async def my_profile(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
     if not user: await callback.message.answer("Анкета не найдена. Напишите /start."); return
+    status = "✅ Активна" if user["is_active"] else "❌ Неактивна (обновите фото)"
     text = (f"👤 <b>{escape(user['name'])}</b>, {user['age']} ({escape(user['gender'])})\n"
-            f"🔍 Ищу: {escape(user['search_gender'])}\n📍 {escape(user['city'])}\n\n📝 {escape(user['bio'])}\n\n💌 Новых лайков: {await get_likes_count(user['user_id'])}")
+            f"🔍 Ищу: {escape(user['search_gender'])}\n📍 {escape(user['city'])}\n\n📝 {escape(user['bio'])}\n\n"
+            f"💌 Новых лайков: {await get_likes_count(user['user_id'])}\nСтатус: {status}")
     builder = InlineKeyboardBuilder(); builder.button(text="✏️ Редактировать", callback_data="edit_profile"); builder.button(text="🔙 В меню", callback_data="menu"); builder.adjust(2)
     try: await callback.message.answer_photo(photo=user["photo_id"], caption=text, reply_markup=builder.as_markup())
     except TelegramBadRequest: await callback.message.answer("Не удалось загрузить фото. Обновите его в разделе редактирования.", reply_markup=builder.as_markup())
@@ -741,7 +865,7 @@ async def my_profile(callback: CallbackQuery):
 @router.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(callback: CallbackQuery):
     await callback.answer()
-    await delete_callback_message(callback) # Удаляем фото, чтобы избежать ошибок edit_text
+    await delete_callback_message(callback)
     await callback.message.answer("Что вы хотите изменить?", reply_markup=edit_profile_keyboard())
 
 @router.callback_query(F.data.in_({"edit_name", "edit_age", "edit_search_gender", "edit_city", "edit_bio", "edit_photo"}))
@@ -792,7 +916,9 @@ async def edit_bio_save(message: Message, state: FSMContext):
 @router.message(EditProfile.photo, F.photo)
 async def edit_photo_save(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
-    await update_user_field(message.from_user.id, "photo_id", photo_id); await state.clear(); await send_menu(message, message.from_user.id, "Фотография успешно обновлена.")
+    await update_user_field(message.from_user.id, "photo_id", photo_id)
+    await update_user_field(message.from_user.id, "is_active", 1) # Восстанавливаем активность
+    await state.clear(); await send_menu(message, message.from_user.id, "Фотография успешно обновлена. Анкета снова активна.")
 
 @router.message(EditProfile.photo)
 async def edit_photo_invalid(message: Message): await message.answer("Пожалуйста, отправьте изображение именно как фотографию.")
@@ -819,13 +945,7 @@ async def delete_profile_execute(callback: CallbackQuery, state: FSMContext):
 async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer(); await state.clear()
     likes = await get_likes_count(callback.from_user.id)
-    if callback.message.photo:
-        try: await callback.message.delete()
-        except TelegramBadRequest: pass
-        await callback.message.answer("Главное меню:", reply_markup=menu_keyboard(likes))
-    else:
-        try: await callback.message.edit_text("Главное меню:", reply_markup=menu_keyboard(likes))
-        except TelegramBadRequest: await callback.message.answer("Главное меню:", reply_markup=menu_keyboard(likes))
+    await safe_edit_or_send(callback, "Главное меню:", reply_markup=menu_keyboard(likes))
 
 @router.callback_query()
 async def unknown_callback(callback: CallbackQuery): await callback.answer("Эта кнопка устарела. Откройте меню заново.", show_alert=True)
