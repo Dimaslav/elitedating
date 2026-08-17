@@ -13,7 +13,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -67,6 +67,7 @@ VALID_GENDERS = {"male": "Парень", "female": "Девушка"}
 VALID_SEARCH_GENDERS = {"male": "Парней", "female": "Девушек", "all": "Всех"}
 VALID_MODES = {"local", "global", "likes"}
 ALLOWED_USER_FIELDS = {"name", "age", "gender", "search_gender", "city", "bio", "photo_id", "username", "is_active"}
+KNOWN_COMMANDS = {"/start", "/delete"}
 
 class LikeResult(Enum):
     LIKED = 1
@@ -95,6 +96,22 @@ def parse_profile_callback(data: Optional[str], expected_action: str) -> Optiona
     except (ValueError, TypeError): return None
     if action != expected_action or p_id <= 0 or mode not in VALID_MODES: return None
     return p_id, mode
+
+# ============================================================
+# PER-USER ACTION LOCKS (защита от двойного тапа)
+# ============================================================
+user_action_locks: Dict[int, asyncio.Lock] = {}
+
+def get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = user_action_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        user_action_locks[user_id] = lock
+    if len(user_action_locks) > 10000:
+        for uid, l in list(user_action_locks.items()):
+            if not l.locked() and uid != user_id:
+                del user_action_locks[uid]
+    return lock
 
 # ============================================================
 # FSM
@@ -212,12 +229,14 @@ async def migrate_db():
     await db.commit()
 
 async def check_ban(user_id: int) -> bool:
-    async with db.execute("SELECT 1 FROM bans WHERE user_id = ?", (user_id,)) as cursor:
-        return await cursor.fetchone() is not None
+    async with db_lock:
+        async with db.execute("SELECT 1 FROM bans WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
 
 async def get_user(user_id: int) -> Optional[aiosqlite.Row]:
-    async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-        return await cursor.fetchone()
+    async with db_lock:
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
 
 async def add_user_to_db(user_id: int, name: str, age: int, gender: str, search_gender: str, city: str, bio: str, photo_id: str, username: Optional[str], accepted_rules_at: str) -> None:
     async with transaction():
@@ -234,22 +253,24 @@ async def update_user_field(user_id: int, field: str, value: Any) -> None:
         await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
         await db.commit()
 
-# ИСПРАВЛЕНО: Не удаляем бан при удалении анкеты
+# Не удаляем бан при удалении анкеты
 async def delete_user(user_id: int) -> None:
     async with transaction():
         await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
 async def get_likes_count(user_id: int) -> int:
-    async with db.execute("""SELECT COUNT(*) FROM likes AS l JOIN users AS u ON u.user_id = l.liker_id
-        WHERE l.liked_id = ? AND l.liker_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?)
-        AND l.liker_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
-        AND l.liker_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
-        AND l.liker_id NOT IN (SELECT user_id FROM bans) AND u.is_active = 1""", (user_id, user_id, user_id, user_id)) as cursor:
-        return (await cursor.fetchone())[0]
+    async with db_lock:
+        async with db.execute("""SELECT COUNT(*) FROM likes AS l JOIN users AS u ON u.user_id = l.liker_id
+            WHERE l.liked_id = ? AND l.liker_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?)
+            AND l.liker_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+            AND l.liker_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+            AND l.liker_id NOT IN (SELECT user_id FROM bans) AND u.is_active = 1""", (user_id, user_id, user_id, user_id)) as cursor:
+            return (await cursor.fetchone())[0]
 
 async def are_users_blocked(u1: int, u2: int) -> bool:
-    async with db.execute("SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)", (u1, u2, u2, u1)) as cursor:
-        return await cursor.fetchone() is not None
+    async with db_lock:
+        async with db.execute("SELECT 1 FROM blocks WHERE (blocker_id=? AND blocked_id=?) OR (blocker_id=? AND blocked_id=?)", (u1, u2, u2, u1)) as cursor:
+            return await cursor.fetchone() is not None
 
 async def add_view(viewer_id: int, viewed_id: int) -> None:
     if viewer_id == viewed_id: return
@@ -257,7 +278,7 @@ async def add_view(viewer_id: int, viewed_id: int) -> None:
         await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (viewer_id, viewed_id))
         await db.commit()
 
-# ИСПРАВЛЕНО: Lifecycle лайков
+# Lifecycle лайков
 async def add_like(liker_id: int, liked_id: int) -> LikeResult:
     if liker_id == liked_id: return LikeResult.REJECTED
     u1, u2 = min(liker_id, liked_id), max(liker_id, liked_id)
@@ -299,8 +320,9 @@ async def block_user(blocker_id: int, blocked_id: int) -> None:
         await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (blocker_id, blocked_id))
 
 async def report_exists(reporter_id: int, reported_id: int) -> bool:
-    async with db.execute("SELECT 1 FROM reports WHERE reporter_id=? AND reported_id=? AND status='pending' LIMIT 1", (reporter_id, reported_id)) as cur:
-        return await cur.fetchone() is not None
+    async with db_lock:
+        async with db.execute("SELECT 1 FROM reports WHERE reporter_id=? AND reported_id=? AND status='pending' LIMIT 1", (reporter_id, reported_id)) as cur:
+            return await cur.fetchone() is not None
 
 async def add_report(reporter_id: int, reported_id: int, reason: str) -> Optional[int]:
     async with db_lock:
@@ -316,7 +338,7 @@ async def ban_user(user_id: int, reason: str, admin_id: Optional[int] = None, re
         if admin_id and report_id:
             await db.execute("UPDATE reports SET status = 'accepted', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (admin_id, report_id))
 
-# ИСПРАВЛЕНО: Учет взаимных предпочтений
+# Учет взаимных предпочтений
 async def get_random_profile(user_id: int, user_gender: str, search_gender: str, user_city: Optional[str] = None, strict_city: bool = False) -> Optional[aiosqlite.Row]:
     query = """SELECT * FROM users 
         WHERE user_id != ? AND is_active = 1
@@ -351,19 +373,22 @@ async def get_random_profile(user_id: int, user_gender: str, search_gender: str,
         else:
             query += " ORDER BY RANDOM() LIMIT 1"
             
-    async with db.execute(query, tuple(params)) as cursor: 
-        return await cursor.fetchone()
+    async with db_lock:
+        async with db.execute(query, tuple(params)) as cursor:
+            return await cursor.fetchone()
 
 async def get_next_liker(user_id: int) -> Optional[aiosqlite.Row]:
-    async with db.execute("""SELECT u.* FROM users AS u JOIN likes AS l ON u.user_id = l.liker_id WHERE l.liked_id = ?
-        AND u.user_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?) AND u.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
-        AND u.user_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?) AND u.user_id NOT IN (SELECT user_id FROM bans) AND u.is_active = 1
-        ORDER BY l.created_at DESC LIMIT 1""", (user_id, user_id, user_id, user_id)) as cursor: 
-        return await cursor.fetchone()
+    async with db_lock:
+        async with db.execute("""SELECT u.* FROM users AS u JOIN likes AS l ON u.user_id = l.liker_id WHERE l.liked_id = ?
+            AND u.user_id NOT IN (SELECT viewed_id FROM views WHERE viewer_id = ?) AND u.user_id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+            AND u.user_id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?) AND u.user_id NOT IN (SELECT user_id FROM bans) AND u.is_active = 1
+            ORDER BY l.created_at DESC LIMIT 1""", (user_id, user_id, user_id, user_id)) as cursor:
+            return await cursor.fetchone()
 
 async def verify_like_exists(liker_id: int, liked_id: int) -> bool:
-    async with db.execute("SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?", (liker_id, liked_id)) as cur:
-        return await cur.fetchone() is not None
+    async with db_lock:
+        async with db.execute("SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?", (liker_id, liked_id)) as cur:
+            return await cur.fetchone() is not None
 
 # ============================================================
 # MIDDLEWARE
@@ -377,14 +402,18 @@ class SecurityMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if not user: return await handler(event, data)
 
+        first_word: Optional[str] = None
+        if isinstance(event, Message) and event.text:
+            first_word = event.text.split()[0].split("@")[0]
+
         if await check_ban(user.id):
-            if isinstance(event, Message) and event.text and event.text.split()[0].split("@")[0] == "/delete":
+            if first_word == "/delete":
                 return await handler(event, data)
             if isinstance(event, Message): await event.answer("Вы заблокированы. Для удаления данных используйте /delete.")
             elif isinstance(event, CallbackQuery): await event.answer("Вы заблокированы.", show_alert=True)
             return
 
-        if isinstance(event, Message) and event.text and event.text.startswith("/"):
+        if first_word in KNOWN_COMMANDS:
             return await handler(event, data)
 
         now = time.monotonic()
@@ -530,7 +559,7 @@ def admin_report_keyboard(report_id: int, reported_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
-# ИСПРАВЛЕНО: Строгая валидация по message_id для всех режимов
+# Строгая валидация по message_id для всех режимов
 async def validate_active_card(callback: CallbackQuery, state: FSMContext, p_id: int, mode: str) -> bool:
     data = await state.get_data()
     if data.get("active_profile_id") != p_id or data.get("active_profile_mode") != mode:
@@ -638,8 +667,13 @@ async def registration_photo(message: Message, state: FSMContext):
 @router.message(Registration.photo)
 async def registration_photo_invalid(message: Message): await message.answer("Пожалуйста, отправьте изображение именно как фотографию.")
 
-@router.message(Registration.name, Registration.age, Registration.city, Registration.bio, EditProfile.name, EditProfile.age, EditProfile.city, EditProfile.bio)
-async def text_required_invalid(message: Message): await message.answer("Пожалуйста, отправьте значение текстом.")
+# ИСПРАВЛЕНО: было AND нескольких состояний (никогда не срабатывало) -> StateFilter с OR-семантикой
+@router.message(StateFilter(
+    Registration.name, Registration.age, Registration.city, Registration.bio,
+    EditProfile.name, EditProfile.age, EditProfile.city, EditProfile.bio,
+))
+async def text_required_invalid(message: Message):
+    await message.answer("Пожалуйста, отправьте значение текстом.")
 
 # ============================================================
 # ПОИСК АНКЕТ И ВЗАИМОДЕЙСТВИЯ
@@ -655,13 +689,23 @@ async def search_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data == "search_local")
 async def search_local(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await show_profile(callback, state, mode="local")
+    uid = callback.from_user.id
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
+    async with lock:
+        await callback.answer()
+        await show_profile(callback, state, mode="local")
 
 @router.callback_query(F.data == "search_global")
 async def search_global(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await show_profile(callback, state, mode="global")
+    uid = callback.from_user.id
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
+    async with lock:
+        await callback.answer()
+        await show_profile(callback, state, mode="global")
 
 @router.callback_query(F.data.startswith("like:"))
 async def like_profile(callback: CallbackQuery, state: FSMContext):
@@ -670,39 +714,44 @@ async def like_profile(callback: CallbackQuery, state: FSMContext):
     liked_id, mode = parsed
     uid = callback.from_user.id
 
-    if liked_id == uid: await callback.answer("Нельзя поставить лайк самому себе.", show_alert=True); return
-    if not await validate_active_card(callback, state, liked_id, mode):
-        await callback.answer("Эта анкета больше не доступна.", show_alert=True)
-        await delete_callback_message(callback); await show_next(callback, state, mode); return
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
 
-    other_user = await get_user(liked_id)
-    if not other_user or await check_ban(liked_id) or await are_users_blocked(uid, liked_id):
-        await callback.answer("Эта анкета больше недоступна.", show_alert=True)
-        await delete_callback_message(callback); await show_next(callback, state, mode); return
+    async with lock:
+        if liked_id == uid: await callback.answer("Нельзя поставить лайк самому себе.", show_alert=True); return
+        if not await validate_active_card(callback, state, liked_id, mode):
+            await callback.answer("Эта анкета больше не доступна.", show_alert=True)
+            await delete_callback_message(callback); await show_next(callback, state, mode); return
 
-    await callback.answer()
-    result = await add_like(uid, liked_id)
-    await delete_callback_message(callback)
+        other_user = await get_user(liked_id)
+        if not other_user or await check_ban(liked_id) or await are_users_blocked(uid, liked_id):
+            await callback.answer("Эта анкета больше недоступна.", show_alert=True)
+            await delete_callback_message(callback); await show_next(callback, state, mode); return
 
-    if result == LikeResult.REJECTED:
-        await callback.message.answer("Не удалось поставить лайк (блокировка или бан).")
-        await show_next(callback, state, mode); return
+        await callback.answer()
+        result = await add_like(uid, liked_id)
+        await delete_callback_message(callback)
 
-    if result == LikeResult.LIKED:
-        await show_next(callback, state, mode); return
+        if result == LikeResult.REJECTED:
+            await callback.message.answer("Не удалось поставить лайк (блокировка или бан).")
+            await show_next(callback, state, mode); return
 
-    # MATCHED
-    current_user = await get_user(uid)
-    if not current_user: return
-    text_me = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(other_user['name'])}.\nНаписать можно через кнопку ниже."
-    text_other = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(current_user['name'])}.\nНаписать можно через кнопку ниже."
+        if result == LikeResult.LIKED:
+            await show_next(callback, state, mode); return
 
-    try: await bot.send_message(uid, text_me, reply_markup=match_keyboard(liked_id))
-    except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", uid)
-    try: await bot.send_message(liked_id, text_other, reply_markup=match_keyboard(uid))
-    except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", liked_id)
+        # MATCHED
+        current_user = await get_user(uid)
+        if not current_user: return
+        text_me = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(other_user['name'])}.\nНаписать можно через кнопку ниже."
+        text_other = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(current_user['name'])}.\nНаписать можно через кнопку ниже."
 
-    await callback.message.answer("У вас мэтч! ❤️\n\nПродолжить поиск можно через главное меню.", reply_markup=menu_keyboard(await get_likes_count(uid)))
+        try: await bot.send_message(uid, text_me, reply_markup=match_keyboard(liked_id))
+        except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", uid)
+        try: await bot.send_message(liked_id, text_other, reply_markup=match_keyboard(uid))
+        except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", liked_id)
+
+        await callback.message.answer("У вас мэтч! ❤️\n\nПродолжить поиск можно через главное меню.", reply_markup=menu_keyboard(await get_likes_count(uid)))
 
 @router.callback_query(F.data.startswith("dislike:"))
 async def dislike_profile(callback: CallbackQuery, state: FSMContext):
@@ -710,14 +759,19 @@ async def dislike_profile(callback: CallbackQuery, state: FSMContext):
     if not parsed: await callback.answer("Некорректные данные.", show_alert=True); return
     p_id, mode = parsed; uid = callback.from_user.id
 
-    if not await validate_active_card(callback, state, p_id, mode):
-        await callback.answer("Эта анкета больше не доступна.", show_alert=True)
-        await delete_callback_message(callback); await show_next(callback, state, mode); return
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
 
-    if p_id != uid and await get_user(p_id):
-        if mode == "likes": await reject_like(uid, p_id)
-        else: await add_view(uid, p_id)
-    await callback.answer(); await delete_callback_message(callback); await show_next(callback, state, mode)
+    async with lock:
+        if not await validate_active_card(callback, state, p_id, mode):
+            await callback.answer("Эта анкета больше не доступна.", show_alert=True)
+            await delete_callback_message(callback); await show_next(callback, state, mode); return
+
+        if p_id != uid and await get_user(p_id):
+            if mode == "likes": await reject_like(uid, p_id)
+            else: await add_view(uid, p_id)
+        await callback.answer(); await delete_callback_message(callback); await show_next(callback, state, mode)
 
 @router.callback_query(F.data.startswith("block:"))
 async def block_profile(callback: CallbackQuery, state: FSMContext):
@@ -725,25 +779,35 @@ async def block_profile(callback: CallbackQuery, state: FSMContext):
     if not parsed: await callback.answer("Некорректные данные.", show_alert=True); return
     blocked_id, mode = parsed; uid = callback.from_user.id
 
-    if not await validate_active_card(callback, state, blocked_id, mode):
-        await callback.answer("Эта анкета больше не доступна.", show_alert=True)
-        await delete_callback_message(callback); await show_next(callback, state, mode); return
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
 
-    if blocked_id == uid: await callback.answer("Нельзя заблокировать самого себя.", show_alert=True); return
-    if not await get_user(blocked_id): await callback.answer("Анкета недоступна.", show_alert=True); return
+    async with lock:
+        if not await validate_active_card(callback, state, blocked_id, mode):
+            await callback.answer("Эта анкета больше не доступна.", show_alert=True)
+            await delete_callback_message(callback); await show_next(callback, state, mode); return
 
-    await block_user(uid, blocked_id)
-    await callback.answer("Пользователь заблокирован. Все лайки и мэтчи удалены.")
-    await delete_callback_message(callback); await show_next(callback, state, mode)
+        if blocked_id == uid: await callback.answer("Нельзя заблокировать самого себя.", show_alert=True); return
+        if not await get_user(blocked_id): await callback.answer("Анкета недоступна.", show_alert=True); return
+
+        await block_user(uid, blocked_id)
+        await callback.answer("Пользователь заблокирован. Все лайки и мэтчи удалены.")
+        await delete_callback_message(callback); await show_next(callback, state, mode)
 
 @router.callback_query(F.data == "show_likes")
 async def show_likes(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    user = await get_user(callback.from_user.id)
-    if not user or not user["is_active"]:
-        await safe_edit_or_send(callback, "Ваша анкета неактивна.")
-        return
-    await show_next_liker(callback, state)
+    uid = callback.from_user.id
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
+    async with lock:
+        await callback.answer()
+        user = await get_user(uid)
+        if not user or not user["is_active"]:
+            await safe_edit_or_send(callback, "Ваша анкета неактивна.")
+            return
+        await show_next_liker(callback, state)
 
 # ============================================================
 # ЖАЛОБЫ И АДМИН-БАН
@@ -754,19 +818,24 @@ async def start_report(callback: CallbackQuery, state: FSMContext):
     if not parsed: await callback.answer("Некорректные данные.", show_alert=True); return
     rep_id, mode = parsed; uid = callback.from_user.id
 
-    if not await validate_active_card(callback, state, rep_id, mode):
-        await callback.answer("Эта анкета больше не доступна.", show_alert=True)
-        await delete_callback_message(callback); await show_next(callback, state, mode); return
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
 
-    if rep_id == uid: await callback.answer("Нельзя пожаловаться на самого себя.", show_alert=True); return
-    if not await get_user(rep_id): await callback.answer("Анкета не найдена.", show_alert=True); return
-    if await report_exists(uid, rep_id): await callback.answer("Вы уже отправляли жалобу на этого пользователя.", show_alert=True); return
+    async with lock:
+        if not await validate_active_card(callback, state, rep_id, mode):
+            await callback.answer("Эта анкета больше не доступна.", show_alert=True)
+            await delete_callback_message(callback); await show_next(callback, state, mode); return
 
-    await state.set_state(Report.reason); await state.update_data(reported_id=rep_id, mode=mode)
-    await callback.answer()
-    try: await callback.message.edit_reply_markup(reply_markup=None)
-    except TelegramBadRequest: pass
-    await callback.message.answer(f"Опишите причину жалобы.\nМаксимальная длина: {MAX_REPORT_LENGTH} символов.", reply_markup=cancel_report_keyboard())
+        if rep_id == uid: await callback.answer("Нельзя пожаловаться на самого себя.", show_alert=True); return
+        if not await get_user(rep_id): await callback.answer("Анкета не найдена.", show_alert=True); return
+        if await report_exists(uid, rep_id): await callback.answer("Вы уже отправляли жалобу на этого пользователя.", show_alert=True); return
+
+        await state.set_state(Report.reason); await state.update_data(reported_id=rep_id, mode=mode)
+        await callback.answer()
+        try: await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest: pass
+        await callback.message.answer(f"Опишите причину жалобы.\nМаксимальная длина: {MAX_REPORT_LENGTH} символов.", reply_markup=cancel_report_keyboard())
 
 @router.message(Report.reason, F.text)
 async def process_report(message: Message, state: FSMContext):
@@ -822,9 +891,9 @@ async def admin_ban_user(callback: CallbackQuery):
 
     await ban_user(u_id, f"Бан по жалобе #{r_id}", callback.from_user.id, r_id)
     await callback.answer("Пользователь заблокирован. Жалоба закрыта.")
-    try: await callback.message.edit_caption(caption=f"{callback.message.html_text or callback.message.caption}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
+    try: await callback.message.edit_caption(caption=f"{callback.message.html_text}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
     except TelegramBadRequest: 
-        try: await callback.message.edit_text(f"{callback.message.html_text or callback.message.text}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
+        try: await callback.message.edit_text(f"{callback.message.html_text}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
         except TelegramBadRequest: pass
     try: await bot.send_message(u_id, "Вы были заблокированы администрацией. Для удаления данных используйте /delete.")
     except (TelegramBadRequest, TelegramForbiddenError): pass
@@ -841,9 +910,9 @@ async def admin_reject_report(callback: CallbackQuery):
         await db.execute("UPDATE reports SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (callback.from_user.id, r_id))
     
     await callback.answer("Жалоба отклонена.")
-    try: await callback.message.edit_caption(caption=f"{callback.message.html_text or callback.message.caption}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
+    try: await callback.message.edit_caption(caption=f"{callback.message.html_text}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
     except TelegramBadRequest:
-        try: await callback.message.edit_text(f"{callback.message.html_text or callback.message.text}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
+        try: await callback.message.edit_text(f"{callback.message.html_text}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
         except TelegramBadRequest: pass
 
 # ============================================================
