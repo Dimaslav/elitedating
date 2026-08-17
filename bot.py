@@ -449,6 +449,23 @@ async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=Non
 async def send_menu(message: Message, user_id: int, text: str = "Главное меню:") -> None:
     await message.answer(text, reply_markup=menu_keyboard(await get_likes_count(user_id)))
 
+def profile_card_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Редактировать", callback_data="edit_profile")
+    builder.button(text="🔙 В меню", callback_data="menu")
+    builder.adjust(2)
+    return builder.as_markup()
+
+async def send_profile_card(message: Message, user: aiosqlite.Row) -> None:
+    status = "✅ Активна" if user["is_active"] else "❌ Неактивна (обновите фото)"
+    text = (f"👤 <b>{escape(user['name'])}</b>, {user['age']} ({escape(user['gender'])})\n"
+            f"🔍 Ищу: {escape(user['search_gender'])}\n📍 {escape(user['city'])}\n\n📝 {escape(user['bio'])}\n\n"
+            f"💌 Новых лайков: {await get_likes_count(user['user_id'])}\nСтатус: {status}")
+    try:
+        await message.answer_photo(photo=user["photo_id"], caption=text, reply_markup=profile_card_keyboard())
+    except TelegramBadRequest:
+        await message.answer("Не удалось загрузить фото. Обновите его в разделе редактирования.", reply_markup=profile_card_keyboard())
+
 async def show_profile(callback: CallbackQuery, state: FSMContext, mode: str = "global") -> None:
     user = await get_user(callback.from_user.id)
     if not user or not user["is_active"]:
@@ -594,8 +611,12 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     user = await get_user(user_id)
     if user:
-        if user["username"] != message.from_user.username: await update_user_field(user_id, "username", message.from_user.username)
-        await send_menu(message, user_id, "С возвращением! Выберите действие:"); return
+        if user["username"] != message.from_user.username:
+            await update_user_field(user_id, "username", message.from_user.username)
+        await message.answer("С возвращением! Вот ваша анкета:")
+        await send_profile_card(message, user)
+        await send_menu(message, user_id)
+        return
 
     await state.set_state(Registration.agreement)
     builder = InlineKeyboardBuilder(); builder.button(text="✅ Мне есть 18 лет, принимаю правила", callback_data="agree_rules")
@@ -667,7 +688,7 @@ async def registration_photo(message: Message, state: FSMContext):
 @router.message(Registration.photo)
 async def registration_photo_invalid(message: Message): await message.answer("Пожалуйста, отправьте изображение именно как фотографию.")
 
-# ИСПРАВЛЕНО: было AND нескольких состояний (никогда не срабатывало) -> StateFilter с OR-семантикой
+# StateFilter — правильная OR-семантика по нескольким состояниям
 @router.message(StateFilter(
     Registration.name, Registration.age, Registration.city, Registration.bio,
     EditProfile.name, EditProfile.age, EditProfile.city, EditProfile.bio,
@@ -922,14 +943,10 @@ async def admin_reject_report(callback: CallbackQuery):
 async def my_profile(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
-    if not user: await callback.message.answer("Анкета не найдена. Напишите /start."); return
-    status = "✅ Активна" if user["is_active"] else "❌ Неактивна (обновите фото)"
-    text = (f"👤 <b>{escape(user['name'])}</b>, {user['age']} ({escape(user['gender'])})\n"
-            f"🔍 Ищу: {escape(user['search_gender'])}\n📍 {escape(user['city'])}\n\n📝 {escape(user['bio'])}\n\n"
-            f"💌 Новых лайков: {await get_likes_count(user['user_id'])}\nСтатус: {status}")
-    builder = InlineKeyboardBuilder(); builder.button(text="✏️ Редактировать", callback_data="edit_profile"); builder.button(text="🔙 В меню", callback_data="menu"); builder.adjust(2)
-    try: await callback.message.answer_photo(photo=user["photo_id"], caption=text, reply_markup=builder.as_markup())
-    except TelegramBadRequest: await callback.message.answer("Не удалось загрузить фото. Обновите его в разделе редактирования.", reply_markup=builder.as_markup())
+    if not user:
+        await callback.message.answer("Анкета не найдена. Напишите /start.")
+        return
+    await send_profile_card(callback.message, user)
 
 @router.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(callback: CallbackQuery):
