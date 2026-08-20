@@ -672,24 +672,66 @@ async def cmd_start(message: Message, state: FSMContext):
     if user:
         if user["username"] != message.from_user.username:
             await update_user_field(user_id, "username", message.from_user.username)
+        # Версионирование правил: при обновлении RULES_VERSION просим подтвердить заново
+        if not user["accepted_rules_at"] or (user["accepted_rules_version"] or 0) < RULES_VERSION:
+            await state.set_state(Registration.agreement)
+            await state.update_data(reaccept=True)
+            await message.answer("Правила сервиса обновились. Пожалуйста, ознакомьтесь и подтвердите их:", reply_markup=rules_keyboard())
+            return
         await message.answer("С возвращением! Вот ваша анкета:")
         await send_profile_card(message, user)
         await send_menu(message, user_id)
         return
 
     await state.set_state(Registration.agreement)
-    builder = InlineKeyboardBuilder(); builder.button(text="✅ Мне есть 18 лет, принимаю правила", callback_data="agree_rules")
-    await message.answer("Добро пожаловать в бот знакомств!\n\n⚠️ <b>Правила:</b>\n1. Сервис предназначен только для пользователей 18+.\n2. Запрещены оскорбления, мошенничество и спам.\n3. Уважайте личные границы и приватность других людей.\n4. Не публикуйте чужие фотографии и личные данные.\n\nПродолжая, вы подтверждаете, что вам исполнилось 18 лет и вы принимаете правила сервиса.", reply_markup=builder.as_markup())
+    await message.answer("Добро пожаловать в бот знакомств!\n\n" + RULES_TEXT, reply_markup=rules_keyboard())
 
 @router.message(Command("delete"))
 async def cmd_delete(message: Message, state: FSMContext):
     await state.clear(); await delete_user(message.from_user.id)
     await message.answer("Ваша анкета и все связанные с ней данные удалены. Для новой регистрации напишите /start.")
 
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "ℹ️ <b>Справка</b>\n\n"
+        "Бот помогает найти людей для знакомства: смотрите анкеты, ставьте лайки, а при взаимной симпатии получите мэтч и сможете общаться.\n\n"
+        "<b>Команды:</b>\n"
+        "/start — показать анкету и главное меню\n"
+        "/help — эта справка\n"
+        "/delete — полностью удалить свои данные\n\n" + RULES_TEXT)
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Команда доступна только администратору.")
+        return
+    s = await get_stats()
+    await message.answer(
+        "📊 <b>Статистика бота</b>\n\n"
+        f"👥 Анкет: {s['users_total']} (активных: {s['users_active']})\n"
+        f"❤️ Лайков: {s['likes']}\n"
+        f"💑 Мэтчей: {s['matches']}\n"
+        f"👀 Просмотров: {s['views']}\n"
+        f"🚫 Блокировок: {s['blocks']}\n"
+        f"⛔ Банов: {s['bans']}\n"
+        f"🚩 Жалоб в ожидании: {s['reports_pending']}")
+
 @router.callback_query(Registration.agreement, F.data == "agree_rules")
 async def registration_agreement(callback: CallbackQuery, state: FSMContext):
-    await callback.answer(); await state.set_state(Registration.name)
-    await state.update_data(accepted_rules_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+    await callback.answer()
+    accepted_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # Повторное принятие правил действующим пользователем
+    if (await state.get_data()).get("reaccept"):
+        await set_rules_accepted(callback.from_user.id, accepted_at)
+        await state.clear()
+        await callback.message.edit_text("Спасибо! Правила приняты. Приятного пользования! 💖")
+        user = await get_user(callback.from_user.id)
+        if user: await send_profile_card(callback.message, user)
+        await send_menu(callback.message, callback.from_user.id)
+        return
+    await state.set_state(Registration.name)
+    await state.update_data(accepted_rules_at=accepted_at)
     await callback.message.edit_text(f"Как вас зовут?\nВведите имя от {MIN_NAME_LENGTH} до {MAX_NAME_LENGTH} символов.")
 
 @router.message(Registration.name, F.text)
@@ -782,9 +824,24 @@ async def search_global(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     lock = get_user_lock(uid)
     if lock.locked():
-        await callback.answer("Пожалуйста, подождите."); return
+        await callback.answer("Пожалуйта, подождите."); return
     async with lock:
         await callback.answer()
+        await show_profile(callback, state, mode="global")
+
+@router.callback_query(F.data == "reset_views")
+async def reset_views(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    lock = get_user_lock(uid)
+    if lock.locked():
+        await callback.answer("Пожалуйста, подождите."); return
+    async with lock:
+        user = await get_user(uid)
+        if not user or not user["is_active"]:
+            await callback.answer("Ваша анкета неактивна. Обновите фото через 'Моя анкета'.", show_alert=True); return
+        async with transaction():
+            await db.execute("DELETE FROM views WHERE viewer_id = ?", (uid,))
+        await callback.answer("Анкеты показаны заново.")
         await show_profile(callback, state, mode="global")
 
 @router.callback_query(F.data.startswith("like:"))
@@ -820,18 +877,20 @@ async def like_profile(callback: CallbackQuery, state: FSMContext):
         if result == LikeResult.LIKED:
             await show_next(callback, state, mode); return
 
-        # MATCHED
+        # MATCHED: уведомляем обе стороны (по одному сообщению) и продолжаем поиск
         current_user = await get_user(uid)
-        if not current_user: return
-        text_me = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(other_user['name'])}.\nНаписать можно через кнопку ниже."
-        text_other = f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(current_user['name'])}.\nНаписать можно через кнопку ниже."
-
-        try: await bot.send_message(uid, text_me, reply_markup=match_keyboard(liked_id))
+        if not current_user:
+            await show_next(callback, state, mode); return
+        try:
+            await callback.message.answer(f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(other_user['name'])}.",
+                reply_markup=match_keyboard(liked_id))
         except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", uid)
-        try: await bot.send_message(liked_id, text_other, reply_markup=match_keyboard(uid))
+        try:
+            await bot.send_message(liked_id, f"💖 <b>Это мэтч!</b>\n\nВы понравились друг другу с {escape(current_user['name'])}.",
+                reply_markup=match_keyboard(uid))
         except (TelegramBadRequest, TelegramForbiddenError): logger.warning("Match send fail to %s", liked_id)
 
-        await callback.message.answer("У вас мэтч! ❤️\n\nПродолжить поиск можно через главное меню.", reply_markup=menu_keyboard(await get_likes_count(uid)))
+        await show_next(callback, state, mode)
 
 @router.callback_query(F.data.startswith("dislike:"))
 async def dislike_profile(callback: CallbackQuery, state: FSMContext):
@@ -885,7 +944,7 @@ async def show_likes(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         user = await get_user(uid)
         if not user or not user["is_active"]:
-            await safe_edit_or_send(callback, "Ваша анкета неактивна.")
+            await safe_edit_or_send(callback, "Ваша анкета неактивна.", reply_markup=back_to_menu_keyboard())
             return
         await show_next_liker(callback, state)
 
@@ -971,9 +1030,10 @@ async def admin_ban_user(callback: CallbackQuery):
 
     await ban_user(u_id, f"Бан по жалобе #{r_id}", callback.from_user.id, r_id)
     await callback.answer("Пользователь заблокирован. Жалоба закрыта.")
-    try: await callback.message.edit_caption(caption=f"{callback.message.html_text}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
+    original = extract_html(callback.message)
+    try: await callback.message.edit_caption(caption=f"{original}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
     except TelegramBadRequest: 
-        try: await callback.message.edit_text(f"{callback.message.html_text}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
+        try: await callback.message.edit_text(f"{original}\n\n✅ Пользователь <code>{u_id}</code> забанен.", reply_markup=None)
         except TelegramBadRequest: pass
     try: await bot.send_message(u_id, "Вы были заблокированы администрацией. Для удаления данных используйте /delete.")
     except (TelegramBadRequest, TelegramForbiddenError): pass
@@ -990,9 +1050,10 @@ async def admin_reject_report(callback: CallbackQuery):
         await db.execute("UPDATE reports SET status = 'rejected', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (callback.from_user.id, r_id))
     
     await callback.answer("Жалоба отклонена.")
-    try: await callback.message.edit_caption(caption=f"{callback.message.html_text}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
+    original = extract_html(callback.message)
+    try: await callback.message.edit_caption(caption=f"{original}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
     except TelegramBadRequest:
-        try: await callback.message.edit_text(f"{callback.message.html_text}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
+        try: await callback.message.edit_text(f"{original}\n\n❌ Жалоба #{r_id} отклонена.", reply_markup=None)
         except TelegramBadRequest: pass
 
 # ============================================================
@@ -1006,6 +1067,21 @@ async def my_profile(callback: CallbackQuery):
         await callback.message.answer("Анкета не найдена. Напишите /start.")
         return
     await send_profile_card(callback.message, user)
+
+@router.callback_query(F.data == "my_matches")
+async def my_matches(callback: CallbackQuery):
+    await callback.answer()
+    matches = await get_matches(callback.from_user.id)
+    if not matches:
+        await safe_edit_or_send(callback, "У вас пока нет мэтчей. Всё ещё впереди — продолжайте искать! 💘", reply_markup=back_to_menu_keyboard())
+        return
+    builder = InlineKeyboardBuilder()
+    for m in matches:
+        name = m["name"] if len(m["name"]) <= 30 else m["name"][:29] + "…"
+        builder.button(text=f"✉️ {name}", url=f"tg://user?id={m['user_id']}")
+    builder.button(text="🔙 В меню", callback_data="menu")
+    builder.adjust(1)
+    await safe_edit_or_send(callback, f"💑 <b>Ваши мэтчи ({len(matches)}):</b>\n\nНажмите на имя, чтобы написать человеку.", reply_markup=builder.as_markup())
 
 @router.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(callback: CallbackQuery):
