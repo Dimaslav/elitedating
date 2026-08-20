@@ -67,7 +67,16 @@ VALID_GENDERS = {"male": "Парень", "female": "Девушка"}
 VALID_SEARCH_GENDERS = {"male": "Парней", "female": "Девушек", "all": "Всех"}
 VALID_MODES = {"local", "global", "likes"}
 ALLOWED_USER_FIELDS = {"name", "age", "gender", "search_gender", "city", "bio", "photo_id", "username", "is_active"}
-KNOWN_COMMANDS = {"/start", "/delete"}
+KNOWN_COMMANDS = {"/start", "/delete", "/help", "/stats"}
+
+RULES_TEXT = (
+    "⚠️ <b>Правила:</b>\n"
+    "1. Сервис предназначен только для пользователей 18+.\n"
+    "2. Запрещены оскорбления, мошенничество и спам.\n"
+    "3. Уважайте личные границы и приватность других людей.\n"
+    "4. Не публикуйте чужие фотографии и личные данные.\n\n"
+    "Продолжая, вы подтверждаете, что вам исполнилось 18 лет и вы принимаете правила сервиса."
+)
 
 class LikeResult(Enum):
     LIKED = 1
@@ -253,6 +262,12 @@ async def update_user_field(user_id: int, field: str, value: Any) -> None:
         await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
         await db.commit()
 
+async def set_rules_accepted(user_id: int, accepted_at: str) -> None:
+    async with db_lock:
+        await db.execute("UPDATE users SET accepted_rules_at = ?, accepted_rules_version = ? WHERE user_id = ?",
+            (accepted_at, RULES_VERSION, user_id))
+        await db.commit()
+
 # Не удаляем бан при удалении анкеты
 async def delete_user(user_id: int) -> None:
     async with transaction():
@@ -390,6 +405,28 @@ async def verify_like_exists(liker_id: int, liked_id: int) -> bool:
         async with db.execute("SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?", (liker_id, liked_id)) as cur:
             return await cur.fetchone() is not None
 
+async def get_matches(user_id: int) -> list:
+    async with db_lock:
+        async with db.execute("""SELECT u.user_id, u.name, m.created_at FROM matches m
+            JOIN users u ON u.user_id = CASE WHEN m.user1_id = ? THEN m.user2_id ELSE m.user1_id END
+            WHERE (m.user1_id = ? OR m.user2_id = ?) AND u.user_id != ? AND u.is_active = 1
+            AND u.user_id NOT IN (SELECT user_id FROM bans)
+            ORDER BY m.created_at DESC LIMIT 50""", (user_id, user_id, user_id, user_id)) as cursor:
+            return await cursor.fetchall()
+
+async def get_stats() -> Dict[str, int]:
+    async with db_lock:
+        async with db.execute("""SELECT
+            (SELECT COUNT(*) FROM users) AS users_total,
+            (SELECT COUNT(*) FROM users WHERE is_active = 1) AS users_active,
+            (SELECT COUNT(*) FROM likes) AS likes,
+            (SELECT COUNT(*) FROM matches) AS matches,
+            (SELECT COUNT(*) FROM views) AS views,
+            (SELECT COUNT(*) FROM blocks) AS blocks,
+            (SELECT COUNT(*) FROM bans) AS bans,
+            (SELECT COUNT(*) FROM reports WHERE status = 'pending') AS reports_pending""") as cursor:
+            return dict(await cursor.fetchone())
+
 # ============================================================
 # MIDDLEWARE
 # ============================================================
@@ -437,6 +474,14 @@ def format_profile(profile: aiosqlite.Row, prefix: str = "") -> str:
     return (f"{prefix}👤 <b>{escape(profile['name'])}</b>, {profile['age']} ({escape(profile['gender'])})\n"
             f"📍 {escape(profile['city'])}\n\n📝 {escape(profile['bio'])}")
 
+# html-контент сообщения: у фото-сообщений текст лежит в caption, а не в text
+def extract_html(message: Message) -> str:
+    if message.photo:
+        caption = getattr(message, "html_caption", None)
+        return caption if caption else escape(message.caption or "")
+    text = getattr(message, "html_text", None)
+    return text if text else escape(message.text or "")
+
 async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=None):
     if callback.message.photo:
         try: await callback.message.delete()
@@ -469,7 +514,7 @@ async def send_profile_card(message: Message, user: aiosqlite.Row) -> None:
 async def show_profile(callback: CallbackQuery, state: FSMContext, mode: str = "global") -> None:
     user = await get_user(callback.from_user.id)
     if not user or not user["is_active"]:
-        await safe_edit_or_send(callback, "Ваша анкета неактивна. Обновите фото через 'Моя анкета' -> 'Редактировать'.")
+        await safe_edit_or_send(callback, "Ваша анкета неактивна. Обновите фото через 'Моя анкета' -> 'Редактировать'.", reply_markup=back_to_menu_keyboard())
         return
 
     while True:
@@ -482,7 +527,7 @@ async def show_profile(callback: CallbackQuery, state: FSMContext, mode: str = "
             strict_city=strict
         )
         if not profile:
-            await safe_edit_or_send(callback, "Подходящие анкеты закончились. Попробуйте позже!", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id)))
+            await safe_edit_or_send(callback, "Подходящие анкеты закончились.\nМожно просмотреть их заново или заглянуть позже.", reply_markup=no_profiles_keyboard())
             return
         try:
             msg = await callback.message.answer_photo(photo=profile["photo_id"], caption=format_profile(profile), reply_markup=profile_keyboard(profile["user_id"], mode))
@@ -521,6 +566,11 @@ async def delete_callback_message(callback: CallbackQuery) -> None:
     try: await callback.message.delete()
     except TelegramBadRequest: pass
 
+def rules_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Мне есть 18 лет, принимаю правила", callback_data="agree_rules")
+    return builder.as_markup()
+
 def gender_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🚹 Парень", callback_data="gender_male"); builder.button(text="🚺 Девушка", callback_data="gender_female"); builder.adjust(2); return builder
@@ -535,8 +585,17 @@ def search_gender_keyboard(with_cancel: bool = False):
 def menu_keyboard(likes_count: int = 0):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔍 Смотреть анкеты", callback_data="search_menu"); builder.button(text="👤 Моя анкета", callback_data="my_profile")
+    builder.button(text="💑 Мои мэтчи", callback_data="my_matches")
     if likes_count > 0: builder.button(text=f"💌 Вам понравились: {likes_count}", callback_data="show_likes")
-    builder.adjust(2, 1); return builder.as_markup()
+    builder.adjust(2, 2 if likes_count > 0 else 1); return builder.as_markup()
+
+def back_to_menu_keyboard():
+    builder = InlineKeyboardBuilder(); builder.button(text="🔙 В меню", callback_data="menu"); return builder.as_markup()
+
+def no_profiles_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Показать анкеты заново", callback_data="reset_views"); builder.button(text="🔙 В меню", callback_data="menu")
+    builder.adjust(1, 1); return builder.as_markup()
 
 def search_menu_keyboard():
     builder = InlineKeyboardBuilder()
@@ -704,7 +763,7 @@ async def search_menu(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
     if not user or not user["is_active"]:
-        await safe_edit_or_send(callback, "Ваша анкета неактивна. Обновите фото через 'Моя анкета'.")
+        await safe_edit_or_send(callback, "Ваша анкета неактивна. Обновите фото через 'Моя анкета'.", reply_markup=back_to_menu_keyboard())
         return
     await safe_edit_or_send(callback, "Где будем искать анкеты?", reply_markup=search_menu_keyboard())
 
