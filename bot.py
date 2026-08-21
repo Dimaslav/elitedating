@@ -4,7 +4,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from html import escape
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, List
@@ -51,7 +51,9 @@ DB_SCHEMA_VERSION = 5
 RULES_VERSION = 2
 
 STARS_PROVIDER_TOKEN = ""
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_support_username")
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT")
+if not SUPPORT_CONTACT:
+    raise RuntimeError("SUPPORT_CONTACT не настроен в .env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -243,334 +245,353 @@ async def migrate_db() -> None:
         raise RuntimeError("База данных новее текущей версии приложения.")
 
     if version < 1:
-        await _migrate_v1()
-        async with db_lock:
-            await db.execute("PRAGMA user_version = 1")
-            await db.commit()
-
+        await _run_migration(1, _migrate_v1)
     if version < 2:
-        await _migrate_v2()
-        async with db_lock:
-            await db.execute("PRAGMA user_version = 2")
-            await db.commit()
-
+        await _run_migration(2, _migrate_v2)
     if version < 3:
-        await _migrate_v3()
-        async with db_lock:
-            await db.execute("PRAGMA user_version = 3")
-            await db.commit()
-
+        await _run_migration(3, _migrate_v3)
     if version < 4:
-        await _migrate_v4()
-        async with db_lock:
-            await db.execute("PRAGMA user_version = 4")
-            await db.commit()
-
+        await _run_migration(4, _migrate_v4)
     if version < 5:
-        await _migrate_v5()
-        async with db_lock:
-            await db.execute("PRAGMA user_version = 5")
-            await db.commit()
+        await _run_migration(5, _migrate_v5)
+
+
+async def _run_migration(target_version: int, migration_coro) -> None:
+    async with transaction():
+        await migration_coro()
+        await db.execute(f"PRAGMA user_version = {target_version}")
 
 
 async def _migrate_v1() -> None:
-    async with transaction():
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                age INTEGER NOT NULL CHECK(age BETWEEN 18 AND 99),
-                gender TEXT NOT NULL CHECK(gender IN ('Парень', 'Девушка')),
-                search_gender TEXT NOT NULL CHECK(search_gender IN ('Парней', 'Девушек', 'Всех')),
-                city TEXT NOT NULL,
-                bio TEXT NOT NULL,
-                photo_id TEXT NOT NULL,
-                username TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                accepted_rules_at DATETIME,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                accepted_rules_version INTEGER
-            )
-            """
+    # Создание базовых таблиц
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            age INTEGER NOT NULL CHECK(age BETWEEN 18 AND 99),
+            gender TEXT NOT NULL CHECK(gender IN ('Парень', 'Девушка')),
+            search_gender TEXT NOT NULL CHECK(search_gender IN ('Парней', 'Девушек', 'Всех')),
+            city TEXT NOT NULL,
+            bio TEXT NOT NULL,
+            photo_id TEXT NOT NULL,
+            username TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            accepted_rules_at DATETIME,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            accepted_rules_version INTEGER
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS views (
-                viewer_id INTEGER NOT NULL,
-                viewed_id INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (viewer_id, viewed_id),
-                CHECK (viewer_id != viewed_id),
-                FOREIGN KEY (viewer_id) REFERENCES users(user_id) ON DELETE CASCADE,
-                FOREIGN KEY (viewed_id) REFERENCES users(user_id) ON DELETE CASCADE
-            )
-            """
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS views (
+            viewer_id INTEGER NOT NULL,
+            viewed_id INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (viewer_id, viewed_id),
+            CHECK (viewer_id != viewed_id),
+            FOREIGN KEY (viewer_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (viewed_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS likes (
-                liker_id INTEGER NOT NULL,
-                liked_id INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (liker_id, liked_id),
-                CHECK (liker_id != liked_id),
-                FOREIGN KEY (liker_id) REFERENCES users(user_id) ON DELETE CASCADE,
-                FOREIGN KEY (liked_id) REFERENCES users(user_id) ON DELETE CASCADE
-            )
-            """
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS likes (
+            liker_id INTEGER NOT NULL,
+            liked_id INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (liker_id, liked_id),
+            CHECK (liker_id != liked_id),
+            FOREIGN KEY (liker_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (liked_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS matches (
-                user1_id INTEGER NOT NULL,
-                user2_id INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user1_id, user2_id),
-                CHECK (user1_id < user2_id),
-                FOREIGN KEY (user1_id) REFERENCES users(user_id) ON DELETE CASCADE,
-                FOREIGN KEY (user2_id) REFERENCES users(user_id) ON DELETE CASCADE
-            )
-            """
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS matches (
+            user1_id INTEGER NOT NULL,
+            user2_id INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user1_id, user2_id),
+            CHECK (user1_id < user2_id),
+            FOREIGN KEY (user1_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (user2_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reporter_id INTEGER NOT NULL,
-                reported_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
-                reviewed_by INTEGER,
-                reviewed_at DATETIME,
-                resolution TEXT,
-                CHECK(reporter_id != reported_id),
-                FOREIGN KEY (reporter_id) REFERENCES users(user_id) ON DELETE CASCADE,
-                FOREIGN KEY (reported_id) REFERENCES users(user_id) ON DELETE CASCADE
-            )
-            """
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter_id INTEGER NOT NULL,
+            reported_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+            reviewed_by INTEGER,
+            reviewed_at DATETIME,
+            resolution TEXT,
+            CHECK(reporter_id != reported_id),
+            FOREIGN KEY (reporter_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (reported_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bans (
-                user_id INTEGER PRIMARY KEY,
-                reason TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bans (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS blocks (
-                blocker_id INTEGER NOT NULL,
-                blocked_id INTEGER NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (blocker_id, blocked_id),
-                CHECK (blocker_id != blocked_id),
-                FOREIGN KEY (blocker_id) REFERENCES users(user_id) ON DELETE CASCADE,
-                FOREIGN KEY (blocked_id) REFERENCES users(user_id) ON DELETE CASCADE
-            )
-            """
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS blocks (
+            blocker_id INTEGER NOT NULL,
+            blocked_id INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (blocker_id, blocked_id),
+            CHECK (blocker_id != blocked_id),
+            FOREIGN KEY (blocker_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (blocked_id) REFERENCES users(user_id) ON DELETE CASCADE
         )
+        """
+    )
 
-        # Индексы для reports
-        await db.execute("DROP INDEX IF EXISTS idx_reports_unique")
-        await db.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique
-            ON reports(reporter_id, reported_id)
-            WHERE status = 'pending'
-            """
-        )
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_reports_status_created ON reports(status, timestamp)")
+    # Проверяем наличие колонки status в reports для legacy БД
+    async with db.execute("PRAGMA table_info(reports)") as cursor:
+        columns = [row[1] for row in await cursor.fetchall()]
+    if "status" not in columns:
+        await db.execute("ALTER TABLE reports ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+        await db.execute("ALTER TABLE reports ADD COLUMN reviewed_by INTEGER")
+        await db.execute("ALTER TABLE reports ADD COLUMN reviewed_at DATETIME")
+        await db.execute("ALTER TABLE reports ADD COLUMN resolution TEXT")
 
-        # Индексы для остальных таблиц
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_active_gender ON users(is_active, gender)")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_users_gender_city_nocase ON users(gender, city COLLATE NOCASE)"
-        )
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_likes_liked ON likes(liked_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_views_viewed ON views(viewed_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_user2 ON matches(user2_id)")
+    # Индексы
+    await db.execute("DROP INDEX IF EXISTS idx_reports_unique")
+    await db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique
+        ON reports(reporter_id, reported_id)
+        WHERE status = 'pending'
+        """
+    )
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_reports_status_created ON reports(status, timestamp)")
+
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_users_active_gender ON users(is_active, gender)")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_users_gender_city_nocase ON users(gender, city COLLATE NOCASE)"
+    )
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_likes_liked ON likes(liked_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_views_viewed ON views(viewed_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_user2 ON matches(user2_id)")
 
 
 async def _migrate_v2() -> None:
-    async with transaction():
-        async with db.execute("PRAGMA table_info(users)") as cursor:
-            columns = [row[1] for row in await cursor.fetchall()]
-        if "is_active" not in columns:
-            await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
-        if "accepted_rules_version" not in columns:
-            await db.execute("ALTER TABLE users ADD COLUMN accepted_rules_version INTEGER")
+    async with db.execute("PRAGMA table_info(users)") as cursor:
+        columns = [row[1] for row in await cursor.fetchall()]
+    if "is_active" not in columns:
+        await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "accepted_rules_version" not in columns:
+        await db.execute("ALTER TABLE users ADD COLUMN accepted_rules_version INTEGER")
 
 
 async def _migrate_v3() -> None:
-    async with transaction():
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS donations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            currency TEXT NOT NULL DEFAULT 'XTR',
+            invoice_payload TEXT NOT NULL,
+            telegram_payment_charge_id TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payment_intents (
+            payload TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            currency TEXT NOT NULL DEFAULT 'XTR',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'cancelled')),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            paid_at DATETIME,
+            telegram_payment_charge_id TEXT UNIQUE,
+            expires_at DATETIME,
+            CHECK (
+                (status = 'pending' AND telegram_payment_charge_id IS NULL)
+                OR
+                (status = 'paid' AND telegram_payment_charge_id IS NOT NULL)
+                OR
+                status = 'cancelled'
+            )
+        )
+        """
+    )
+
+
+async def _migrate_v4() -> None:
+    # Пересоздание donations с NOT NULL UNIQUE для telegram_payment_charge_id
+    await db.execute("DROP TABLE IF EXISTS donations_new")
+
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='donations'"
+    ) as cursor:
+        donations_exists = await cursor.fetchone() is not None
+
+    if donations_exists:
+        async with db.execute("PRAGMA table_info(donations)") as cursor:
+            cols = [row[1] for row in await cursor.fetchall()]
+
+        # Создаём новую таблицу с NOT NULL UNIQUE
         await db.execute(
             """
-            CREATE TABLE IF NOT EXISTS donations (
+            CREATE TABLE donations_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 amount INTEGER NOT NULL CHECK(amount > 0),
                 currency TEXT NOT NULL DEFAULT 'XTR',
                 invoice_payload TEXT NOT NULL,
-                telegram_payment_charge_id TEXT UNIQUE,
+                telegram_payment_charge_id TEXT NOT NULL UNIQUE,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS payment_intents (
-                payload TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                amount INTEGER NOT NULL CHECK(amount > 0),
-                currency TEXT NOT NULL DEFAULT 'XTR',
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'cancelled')),
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                paid_at DATETIME,
-                telegram_payment_charge_id TEXT UNIQUE,
-                expires_at DATETIME,
-                CHECK (
-                    (status = 'pending' AND telegram_payment_charge_id IS NULL)
-                    OR
-                    (status = 'paid' AND telegram_payment_charge_id IS NOT NULL)
-                    OR
-                    status = 'cancelled'
+
+        if "telegram_payment_charge_id" in cols:
+            # Переносим с сохранением charge_id, NULL заменяем на legacy
+            await db.execute(
+                """
+                INSERT INTO donations_new (
+                    id, user_id, amount, currency, invoice_payload,
+                    telegram_payment_charge_id, created_at
                 )
+                SELECT
+                    id,
+                    user_id,
+                    amount,
+                    'XTR',
+                    invoice_payload,
+                    COALESCE(telegram_payment_charge_id, 'legacy_' || id),
+                    created_at
+                FROM donations
+                """
             )
-            """
-        )
-
-
-async def _migrate_v4() -> None:
-    async with transaction():
-        # Пересоздаём donations с NOT NULL UNIQUE для transaction ID
-        async with db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='donations'"
-        ) as cursor:
-            donations_exists = await cursor.fetchone() is not None
-
-        if donations_exists:
-            # Проверяем наличие telegram_payment_charge_id
-            async with db.execute("PRAGMA table_info(donations)") as cursor:
-                cols = [row[1] for row in await cursor.fetchall()]
-
-            if "telegram_payment_charge_id" in cols:
-                await db.execute(
-                    """
-                    CREATE TABLE donations_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        amount INTEGER NOT NULL CHECK(amount > 0),
-                        currency TEXT NOT NULL DEFAULT 'XTR',
-                        invoice_payload TEXT NOT NULL,
-                        telegram_payment_charge_id TEXT NOT NULL UNIQUE,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
+        else:
+            # В старой таблице не было charge_id, генерируем legacy
+            await db.execute(
+                """
+                INSERT INTO donations_new (
+                    id, user_id, amount, currency, invoice_payload,
+                    telegram_payment_charge_id, created_at
                 )
-                # Переносим, заменяя NULL на сгенерированный legacy ID
-                await db.execute(
-                    """
-                    INSERT INTO donations_new (
-                        id, user_id, amount, currency, invoice_payload,
-                        telegram_payment_charge_id, created_at
-                    )
-                    SELECT
-                        id,
-                        user_id,
-                        amount,
-                        'XTR',
-                        invoice_payload,
-                        COALESCE(telegram_payment_charge_id, 'legacy_' || id),
-                        created_at
-                    FROM donations
-                    """
-                )
-                await db.execute("DROP TABLE donations")
-                await db.execute("ALTER TABLE donations_new RENAME TO donations")
-            else:
-                # Старая таблица без charge_id – пересоздаём с добавлением
-                await db.execute(
-                    """
-                    CREATE TABLE donations_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        amount INTEGER NOT NULL CHECK(amount > 0),
-                        currency TEXT NOT NULL DEFAULT 'XTR',
-                        invoice_payload TEXT NOT NULL,
-                        telegram_payment_charge_id TEXT NOT NULL UNIQUE,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-                await db.execute(
-                    """
-                    INSERT INTO donations_new (id, user_id, amount, currency, invoice_payload, created_at)
-                    SELECT id, user_id, amount, 'XTR', invoice_payload, created_at
-                    FROM donations
-                    """
-                )
-                await db.execute("DROP TABLE donations")
-                await db.execute("ALTER TABLE donations_new RENAME TO donations")
+                SELECT
+                    id,
+                    user_id,
+                    amount,
+                    'XTR',
+                    invoice_payload,
+                    'legacy_' || id,
+                    created_at
+                FROM donations
+                """
+            )
 
-        # Уникальный индекс на invoice_payload для гарантии "один платёж - одна запись"
-        await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_donations_invoice_payload ON donations(invoice_payload)"
-        )
+        await db.execute("DROP TABLE donations")
+        await db.execute("ALTER TABLE donations_new RENAME TO donations")
+
+    # Уникальный индекс на invoice_payload
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_donations_invoice_payload ON donations(invoice_payload)"
+    )
 
 
 async def _migrate_v5() -> None:
-    """Пересоздаём reports с ON DELETE SET NULL и добавляем snapshots."""
-    async with transaction():
-        await db.execute(
-            """
-            CREATE TABLE reports_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reporter_id INTEGER,
-                reported_id INTEGER,
-                reported_name_snapshot TEXT,
-                reported_username_snapshot TEXT,
-                reason TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
-                reviewed_by INTEGER,
-                reviewed_at DATETIME,
-                resolution TEXT,
-                FOREIGN KEY (reporter_id) REFERENCES users(user_id) ON DELETE SET NULL,
-                FOREIGN KEY (reported_id) REFERENCES users(user_id) ON DELETE SET NULL
-            )
-            """
-        )
-        # Копируем данные
-        await db.execute(
-            """
-            INSERT INTO reports_new (
-                id, reporter_id, reported_id, reason, timestamp,
-                status, reviewed_by, reviewed_at, resolution
-            )
-            SELECT id, reporter_id, reported_id, reason, timestamp,
-                   status, reviewed_by, reviewed_at, resolution
-            FROM reports
-            """
-        )
-        await db.execute("DROP TABLE reports")
-        await db.execute("ALTER TABLE reports_new RENAME TO reports")
+    """
+    Пересоздаём reports с сохранением immutable audit данных.
+    - reporter_id и reported_id остаются NOT NULL без FK (чтобы сохранить возможность бана после удаления).
+    - Добавляем snapshots: reported_name_snapshot, reported_username_snapshot, reported_photo_id_snapshot.
+    - Для старых отчётов заполняем snapshot из существующих users (если доступны).
+    """
+    await db.execute("DROP TABLE IF EXISTS reports_new")
 
-        # Уникальный индекс на pending, только когда оба ID не NULL
-        await db.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique
-            ON reports(reporter_id, reported_id)
-            WHERE status = 'pending' AND reporter_id IS NOT NULL AND reported_id IS NOT NULL
-            """
+    await db.execute(
+        """
+        CREATE TABLE reports_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter_id INTEGER NOT NULL,
+            reported_id INTEGER NOT NULL,
+            reported_name_snapshot TEXT,
+            reported_username_snapshot TEXT,
+            reported_photo_id_snapshot TEXT,
+            reason TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
+            reviewed_by INTEGER,
+            reviewed_at DATETIME,
+            resolution TEXT
         )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_reports_status_created ON reports(status, timestamp)"
+        """
+    )
+
+    # Копируем данные, заполняя snapshots
+    await db.execute(
+        """
+        INSERT INTO reports_new (
+            id,
+            reporter_id,
+            reported_id,
+            reported_name_snapshot,
+            reported_username_snapshot,
+            reported_photo_id_snapshot,
+            reason,
+            timestamp,
+            status,
+            reviewed_by,
+            reviewed_at,
+            resolution
         )
+        SELECT
+            r.id,
+            r.reporter_id,
+            r.reported_id,
+            u.name,
+            u.username,
+            u.photo_id,
+            r.reason,
+            r.timestamp,
+            r.status,
+            r.reviewed_by,
+            r.reviewed_at,
+            r.resolution
+        FROM reports r
+        LEFT JOIN users u ON u.user_id = r.reported_id
+        """
+    )
+
+    await db.execute("DROP TABLE reports")
+    await db.execute("ALTER TABLE reports_new RENAME TO reports")
+
+    # Уникальный индекс: запрещаем дубликаты жалоб от одного пользователя на другого
+    await db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_unique_reporter_reported
+        ON reports(reporter_id, reported_id)
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reports_status_created ON reports(status, timestamp)"
+    )
 
 
 # ============================================================
@@ -708,7 +729,6 @@ async def set_rules_accepted(user_id: int, accepted_at: str) -> None:
 
 
 async def delete_user(user_id: int) -> None:
-    """Удаление пользователя. Reports теперь сохраняются с SET NULL."""
     async with transaction():
         await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
@@ -854,7 +874,6 @@ async def block_user(blocker_id: int, blocked_id: int) -> None:
 
 
 async def report_exists(reporter_id: int, reported_id: int) -> bool:
-    """Проверяем, существует ли уже любая жалоба от этого пользователя на другого."""
     async with db_lock:
         async with db.execute(
             "SELECT 1 FROM reports WHERE reporter_id=? AND reported_id=? LIMIT 1",
@@ -863,51 +882,50 @@ async def report_exists(reporter_id: int, reported_id: int) -> bool:
             return await cur.fetchone() is not None
 
 
-async def add_report(reporter_id: int, reported_id: int, reason: str) -> Optional[int]:
+async def add_report(reporter_id: int, reported_id: int, reason: str) -> Optional[dict]:
     if reporter_id == reported_id:
         return None
     async with transaction():
-        # Проверяем, что цель активна и не забанена
         async with db.execute(
             """
-            SELECT 1 FROM users u
-            WHERE u.user_id=? AND u.is_active=1
-              AND NOT EXISTS (SELECT 1 FROM bans b WHERE b.user_id=u.user_id)
+            SELECT name, username, photo_id FROM users
+            WHERE user_id=? AND is_active=1
+              AND NOT EXISTS (SELECT 1 FROM bans WHERE user_id=?)
             """,
-            (reported_id,),
-        ) as cur:
-            if not await cur.fetchone():
-                return None
-
-        # Получаем snapshots для сохранения данных о нарушителе
-        async with db.execute(
-            "SELECT name, username FROM users WHERE user_id=?",
-            (reported_id,),
+            (reported_id, reported_id),
         ) as cur:
             row = await cur.fetchone()
         if not row:
             return None
-        reported_name = row["name"]
-        reported_username = row["username"]
 
         try:
             cur = await db.execute(
                 """
                 INSERT INTO reports (
                     reporter_id, reported_id, reported_name_snapshot,
-                    reported_username_snapshot, reason
+                    reported_username_snapshot, reported_photo_id_snapshot, reason
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (reporter_id, reported_id, reported_name, reported_username, reason),
+                (reporter_id, reported_id, row["name"], row["username"], row["photo_id"], reason),
             )
-            return cur.lastrowid
+            report_id = cur.lastrowid
         except aiosqlite.IntegrityError:
             return None
+
+        return {
+            "id": report_id,
+            "reported_id": reported_id,
+            "reported_name": row["name"],
+            "reported_username": row["username"],
+            "reported_photo_id": row["photo_id"],
+            "reason": reason,
+        }
 
 
 async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
     async with transaction():
+        # Обновляем статус отчёта
         cur = await db.execute(
             """
             UPDATE reports
@@ -921,11 +939,11 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
 
         async with db.execute("SELECT reported_id FROM reports WHERE id=?", (report_id,)) as cur:
             row = await cur.fetchone()
-            if not row or row["reported_id"] is None:
+            if not row:
                 return None
-
         reported_id = row["reported_id"]
 
+        # Вставляем бан (bans не имеет FK, поэтому работает даже если пользователь удалён)
         await db.execute(
             """
             INSERT INTO bans (user_id, reason) VALUES (?, ?)
@@ -933,6 +951,8 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
             """,
             (reported_id, f"Бан по жалобе #{report_id}"),
         )
+
+        # Удаляем лайки и матчи (если пользователь ещё существует)
         await db.execute(
             "DELETE FROM likes WHERE liker_id=? OR liked_id=?",
             (reported_id, reported_id),
@@ -942,6 +962,7 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
             (reported_id, reported_id),
         )
 
+        # Закрываем остальные pending отчёты на этого пользователя
         await db.execute(
             """
             UPDATE reports
@@ -1114,9 +1135,6 @@ async def get_all_users(limit: int = 20, offset: int = 0) -> List[aiosqlite.Row]
 # ПЛАТЕЖИ И ДОНАТЫ
 # ============================================================
 async def create_payment_intent(user_id: int, amount: int, payload: str) -> None:
-    expires_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S", datetime.now(timezone.utc).timetuple())
-    # Правильнее использовать datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    from datetime import timedelta
     expires = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     async with db_lock:
         await db.execute(
@@ -1154,58 +1172,95 @@ async def mark_payment_paid(
     currency: str,
     charge_id: str,
 ) -> PaymentResult:
-    async with transaction():
-        # Проверяем существование intent
-        intent = await get_payment_intent(payload)
-        if not intent:
-            return PaymentResult.INVALID
-        if intent["status"] == "paid":
-            # Уже оплачен – проверяем совпадение всех данных
-            if (
-                intent["user_id"] == user_id
-                and intent["amount"] == amount
-                and intent["currency"] == currency
-                and intent["telegram_payment_charge_id"] == charge_id
-            ):
-                return PaymentResult.ALREADY_PAID
-            return PaymentResult.INVALID
-        if intent["status"] != "pending":
-            return PaymentResult.INVALID
-        if intent["user_id"] != user_id or intent["amount"] != amount or intent["currency"] != currency:
-            return PaymentResult.INVALID
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Проверяем срок действия
-        if intent["expires_at"] and intent["expires_at"] < datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"):
-            return PaymentResult.INVALID
-
-        # Обновляем intent
-        cur = await db.execute(
-            """
-            UPDATE payment_intents
-            SET status='paid',
-                paid_at=CURRENT_TIMESTAMP,
-                telegram_payment_charge_id=?
-            WHERE payload=? AND status='pending'
-            """,
-            (charge_id, payload),
-        )
-        if cur.rowcount == 0:
-            return PaymentResult.INVALID
-
-        # Вставляем donation
+    async with db_lock:
         try:
+            await db.execute("BEGIN IMMEDIATE")
+
+            # Получаем intent напрямую
+            async with db.execute(
+                "SELECT * FROM payment_intents WHERE payload=?",
+                (payload,),
+            ) as cur:
+                intent = await cur.fetchone()
+
+            if not intent:
+                await db.rollback()
+                return PaymentResult.INVALID
+
+            if intent["status"] == "paid":
+                # Проверяем, что это тот же платёж
+                if (
+                    intent["user_id"] == user_id
+                    and intent["amount"] == amount
+                    and intent["currency"] == currency
+                    and intent["telegram_payment_charge_id"] == charge_id
+                ):
+                    await db.rollback()
+                    return PaymentResult.ALREADY_PAID
+                await db.rollback()
+                return PaymentResult.INVALID
+
+            if intent["status"] != "pending":
+                await db.rollback()
+                return PaymentResult.INVALID
+
+            if (
+                intent["user_id"] != user_id
+                or intent["amount"] != amount
+                or intent["currency"] != currency
+            ):
+                await db.rollback()
+                return PaymentResult.INVALID
+
+            if intent["expires_at"] and intent["expires_at"] < now:
+                await db.rollback()
+                return PaymentResult.INVALID
+
+            # Вставляем запись о донате (уникальность charge_id гарантирует идемпотентность)
             await db.execute(
                 """
-                INSERT INTO donations (user_id, amount, currency, invoice_payload, telegram_payment_charge_id)
+                INSERT INTO donations (
+                    user_id, amount, currency, invoice_payload, telegram_payment_charge_id
+                )
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (user_id, amount, currency, payload, charge_id),
             )
-        except aiosqlite.IntegrityError:
-            # Дубликат charge_id – откатываем транзакцию
-            return PaymentResult.INVALID
 
-        return PaymentResult.PAID
+            # Обновляем intent
+            cur = await db.execute(
+                """
+                UPDATE payment_intents
+                SET status='paid', paid_at=CURRENT_TIMESTAMP, telegram_payment_charge_id=?
+                WHERE payload=? AND status='pending'
+                """,
+                (charge_id, payload),
+            )
+            if cur.rowcount != 1:
+                # Это не должно происходить, но на всякий случай откатываем
+                await db.rollback()
+                return PaymentResult.INVALID
+
+            await db.commit()
+            return PaymentResult.PAID
+
+        except aiosqlite.IntegrityError:
+            # Обрабатываем конфликт уникальности (например, повторный charge_id)
+            await db.rollback()
+            # Проверим, не является ли это дубликатом уже обработанного платежа
+            async with db.execute(
+                "SELECT * FROM donations WHERE telegram_payment_charge_id=?",
+                (charge_id,),
+            ) as cur:
+                existing = await cur.fetchone()
+            if existing and existing["invoice_payload"] == payload:
+                return PaymentResult.ALREADY_PAID
+            return PaymentResult.INVALID
+        except Exception:
+            await db.rollback()
+            raise
 
 
 # ============================================================
@@ -1224,7 +1279,7 @@ class SecurityMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        # Пропускаем successful_payment без ограничений
+        # Платёжные апдейты обрабатываются без ограничений
         if isinstance(event, Message) and event.successful_payment:
             return await handler(event, data)
 
@@ -1844,13 +1899,14 @@ async def donate_amount(callback: CallbackQuery):
 @router.pre_checkout_query()
 async def pre_checkout_query_handler(query: PreCheckoutQuery):
     intent = await get_payment_intent(query.invoice_payload)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     if (
         not intent
         or intent["user_id"] != query.from_user.id
         or intent["amount"] != query.total_amount
         or intent["currency"] != query.currency
         or intent["status"] != "pending"
-        or (intent["expires_at"] and intent["expires_at"] < datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        or (intent["expires_at"] and intent["expires_at"] < now)
     ):
         await query.answer(ok=False, error_message="Платёж не может быть обработан.")
         return
@@ -2291,8 +2347,8 @@ async def process_report(message: Message, state: FSMContext):
         return
 
     uid = message.from_user.id
-    r_id = await add_report(uid, rep_id, reason)
-    if r_id is None:
+    report_info = await add_report(uid, rep_id, reason)
+    if report_info is None:
         await state.clear()
         await message.answer(
             "Не удалось отправить жалобу (пользователь недоступен или вы уже жаловались).",
@@ -2300,37 +2356,28 @@ async def process_report(message: Message, state: FSMContext):
         )
         return
 
-    rep_user = await get_user(rep_id)
-    if not rep_user:
-        await state.clear()
-        await message.answer(
-            "Пользователь удалил анкету сразу после жалобы.",
-            reply_markup=menu_keyboard(await get_likes_count(uid)),
-        )
-        return
-
     await add_view(uid, rep_id)
     await message.answer("Жалоба отправлена администрации. Спасибо!", reply_markup=menu_keyboard(await get_likes_count(uid)))
 
-    rep_name = escape(rep_user["name"])
-    rep_un = f"@{escape(rep_user['username'])}" if rep_user["username"] else "нет username"
+    rep_name = escape(report_info["reported_name"])
+    rep_un = f"@{escape(report_info['reported_username'])}" if report_info["reported_username"] else "нет username"
     text = (
-        f"🚨 <b>Новая жалоба #{r_id}</b>\n\n"
+        f"🚨 <b>Новая жалоба #{report_info['id']}</b>\n\n"
         f"<b>От кого:</b> {message.from_user.mention_html()} (ID: <code>{uid}</code>)\n"
         f"<b>На кого:</b> {rep_name} (ID: <code>{rep_id}</code>, {rep_un})\n\n"
         f"<b>Причина:</b>\n{escape(reason)}"
     )
 
     try:
-        if rep_user["photo_id"]:
+        if report_info["reported_photo_id"]:
             await bot.send_photo(
                 ADMIN_ID,
-                photo=rep_user["photo_id"],
+                photo=report_info["reported_photo_id"],
                 caption=text,
-                reply_markup=admin_report_keyboard(r_id),
+                reply_markup=admin_report_keyboard(report_info["id"]),
             )
         else:
-            await bot.send_message(ADMIN_ID, text, reply_markup=admin_report_keyboard(r_id))
+            await bot.send_message(ADMIN_ID, text, reply_markup=admin_report_keyboard(report_info["id"]))
     except (TelegramBadRequest, TelegramForbiddenError) as e:
         logger.exception("Fail send report to admin: %s", e)
     finally:
@@ -2368,7 +2415,7 @@ async def admin_ban_user(callback: CallbackQuery):
 
     reported_id = await ban_user_from_report(r_id, callback.from_user.id)
     if not reported_id:
-        return await handle_stale_callback(callback, "Эта жалоба уже обработана.")
+        return await handle_stale_callback(callback, "Эта жалоба уже обработана или пользователь удалён.")
 
     await callback.answer("Пользователь заблокирован. Жалоба закрыта.")
     original = extract_html(callback.message)
@@ -2602,7 +2649,7 @@ async def delete_profile_confirm(callback: CallbackQuery):
     await callback.message.edit_text(
         "Вы уверены, что хотите удалить анкету?\n\n"
         "Будут удалены профиль, лайки, просмотры, блокировки и связанные данные. "
-        "Это действие нельзя отменить.",
+        "Жалобы и платёжные записи сохраняются. Это действие нельзя отменить.",
         reply_markup=builder.as_markup(),
     )
 
@@ -2613,7 +2660,8 @@ async def delete_profile_execute(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await delete_user(callback.from_user.id)
     await callback.message.edit_text(
-        "Ваша анкета и связанные данные удалены.\n\nЧтобы зарегистрироваться снова, напишите /start."
+        "Ваша анкета и связанные данные удалены.\n"
+        "Жалобы и платёжные записи сохраняются.\n\nЧтобы зарегистрироваться снова, напишите /start."
     )
 
 
