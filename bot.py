@@ -47,7 +47,7 @@ if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID не настроен.")
 
 DB_NAME = os.getenv("DB_NAME", "dating_bot.db")
-DB_SCHEMA_VERSION = 5
+DB_SCHEMA_VERSION = 6  # Бамп версии: фикс схемы reports
 RULES_VERSION = 2
 
 STARS_PROVIDER_TOKEN = ""
@@ -114,6 +114,12 @@ class PaymentResult(Enum):
     PAID = 1
     ALREADY_PAID = 2
     INVALID = 3
+
+
+class UpdatePhotoResult(Enum):
+    UPDATED = 1
+    BANNED = 2
+    NOT_FOUND = 3
 
 
 def normalize_text(value: str) -> str:
@@ -254,6 +260,8 @@ async def migrate_db() -> None:
         await _run_migration(4, _migrate_v4)
     if version < 5:
         await _run_migration(5, _migrate_v5)
+    if version < 6:
+        await _run_migration(6, _migrate_v6)
 
 
 async def _run_migration(target_version: int, migration_coro) -> None:
@@ -363,7 +371,6 @@ async def _migrate_v1() -> None:
         """
     )
 
-    # Проверяем наличие колонки status в reports для legacy БД
     async with db.execute("PRAGMA table_info(reports)") as cursor:
         columns = [row[1] for row in await cursor.fetchall()]
     if "status" not in columns:
@@ -372,7 +379,6 @@ async def _migrate_v1() -> None:
         await db.execute("ALTER TABLE reports ADD COLUMN reviewed_at DATETIME")
         await db.execute("ALTER TABLE reports ADD COLUMN resolution TEXT")
 
-    # Индексы
     await db.execute("DROP INDEX IF EXISTS idx_reports_unique")
     await db.execute(
         """
@@ -441,7 +447,6 @@ async def _migrate_v3() -> None:
 
 
 async def _migrate_v4() -> None:
-    # Пересоздание donations с NOT NULL UNIQUE для telegram_payment_charge_id
     await db.execute("DROP TABLE IF EXISTS donations_new")
 
     async with db.execute(
@@ -453,7 +458,6 @@ async def _migrate_v4() -> None:
         async with db.execute("PRAGMA table_info(donations)") as cursor:
             cols = [row[1] for row in await cursor.fetchall()]
 
-        # Создаём новую таблицу с NOT NULL UNIQUE
         await db.execute(
             """
             CREATE TABLE donations_new (
@@ -469,7 +473,6 @@ async def _migrate_v4() -> None:
         )
 
         if "telegram_payment_charge_id" in cols:
-            # Переносим с сохранением charge_id, NULL заменяем на legacy
             await db.execute(
                 """
                 INSERT INTO donations_new (
@@ -488,7 +491,6 @@ async def _migrate_v4() -> None:
                 """
             )
         else:
-            # В старой таблице не было charge_id, генерируем legacy
             await db.execute(
                 """
                 INSERT INTO donations_new (
@@ -510,7 +512,6 @@ async def _migrate_v4() -> None:
         await db.execute("DROP TABLE donations")
         await db.execute("ALTER TABLE donations_new RENAME TO donations")
 
-    # Уникальный индекс на invoice_payload
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_donations_invoice_payload ON donations(invoice_payload)"
     )
@@ -518,10 +519,15 @@ async def _migrate_v4() -> None:
 
 async def _migrate_v5() -> None:
     """
-    Пересоздаём reports с сохранением immutable audit данных.
-    - reporter_id и reported_id остаются NOT NULL без FK (чтобы сохранить возможность бана после удаления).
-    - Добавляем snapshots: reported_name_snapshot, reported_username_snapshot, reported_photo_id_snapshot.
-    - Для старых отчётов заполняем snapshot из существующих users (если доступны).
+    Оставлена без изменений для тех баз, где она ещё не выполнялась.
+    Если база уже на v5, эта миграция пропускается.
+    """
+    pass
+
+
+async def _migrate_v6() -> None:
+    """
+    Окончательно фиксит схему reports: immutable audit без FK и со snapshots.
     """
     await db.execute("DROP TABLE IF EXISTS reports_new")
 
@@ -544,45 +550,51 @@ async def _migrate_v5() -> None:
         """
     )
 
-    # Копируем данные, заполняя snapshots
-    await db.execute(
-        """
-        INSERT INTO reports_new (
-            id,
-            reporter_id,
-            reported_id,
-            reported_name_snapshot,
-            reported_username_snapshot,
-            reported_photo_id_snapshot,
-            reason,
-            timestamp,
-            status,
-            reviewed_by,
-            reviewed_at,
-            resolution
-        )
-        SELECT
-            r.id,
-            r.reporter_id,
-            r.reported_id,
-            u.name,
-            u.username,
-            u.photo_id,
-            r.reason,
-            r.timestamp,
-            r.status,
-            r.reviewed_by,
-            r.reviewed_at,
-            r.resolution
-        FROM reports r
-        LEFT JOIN users u ON u.user_id = r.reported_id
-        """
-    )
+    # Проверяем, существует ли таблица reports (на случай, если кто-то стартует с v4)
+    async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reports'") as cursor:
+        if await cursor.fetchone():
+            # Удаляем записи с NULL, которые могли появиться из-за старого ON DELETE SET NULL
+            await db.execute("DELETE FROM reports WHERE reporter_id IS NULL OR reported_id IS NULL")
+            
+            # Копируем данные, заполняя snapshots из существующих users
+            await db.execute(
+                """
+                INSERT INTO reports_new (
+                    id,
+                    reporter_id,
+                    reported_id,
+                    reported_name_snapshot,
+                    reported_username_snapshot,
+                    reported_photo_id_snapshot,
+                    reason,
+                    timestamp,
+                    status,
+                    reviewed_by,
+                    reviewed_at,
+                    resolution
+                )
+                SELECT
+                    r.id,
+                    r.reporter_id,
+                    r.reported_id,
+                    u.name,
+                    u.username,
+                    u.photo_id,
+                    r.reason,
+                    r.timestamp,
+                    r.status,
+                    r.reviewed_by,
+                    r.reviewed_at,
+                    r.resolution
+                FROM reports r
+                LEFT JOIN users u ON u.user_id = r.reported_id
+                """
+            )
+            await db.execute("DROP TABLE reports")
 
-    await db.execute("DROP TABLE reports")
     await db.execute("ALTER TABLE reports_new RENAME TO reports")
 
-    # Уникальный индекс: запрещаем дубликаты жалоб от одного пользователя на другого
+    await db.execute("DROP INDEX IF EXISTS idx_reports_unique_reporter_reported")
     await db.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_unique_reporter_reported
@@ -701,16 +713,18 @@ async def update_user_field(user_id: int, field: str, value: Any) -> None:
         await db.commit()
 
 
-async def update_photo(user_id: int, photo_id: str) -> bool:
+async def update_photo(user_id: int, photo_id: str) -> UpdatePhotoResult:
     async with transaction():
         async with db.execute("SELECT 1 FROM bans WHERE user_id=?", (user_id,)) as cur:
             if await cur.fetchone():
-                return False
+                return UpdatePhotoResult.BANNED
         cur = await db.execute(
             "UPDATE users SET photo_id=?, is_active=1 WHERE user_id=?",
             (photo_id, user_id),
         )
-        return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return UpdatePhotoResult.UPDATED
+        return UpdatePhotoResult.NOT_FOUND
 
 
 async def deactivate_user_profile(user_id: int) -> None:
@@ -762,11 +776,14 @@ async def add_view(viewer_id: int, viewed_id: int) -> None:
     if viewer_id == viewed_id:
         return
     async with db_lock:
-        await db.execute(
-            "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
-            (viewer_id, viewed_id),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
+                (viewer_id, viewed_id),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            await db.rollback()
 
 
 async def add_like(liker_id: int, liked_id: int) -> LikeResult:
@@ -808,10 +825,13 @@ async def add_like(liker_id: int, liked_id: int) -> LikeResult:
             "INSERT OR IGNORE INTO likes (liker_id, liked_id) VALUES (?, ?)",
             (liker_id, liked_id),
         )
-        await db.execute(
-            "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
-            (liker_id, liked_id),
-        )
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
+                (liker_id, liked_id),
+            )
+        except aiosqlite.IntegrityError:
+            pass
 
         async with db.execute(
             "SELECT 1 FROM likes WHERE liker_id=? AND liked_id=?",
@@ -826,10 +846,13 @@ async def add_like(liker_id: int, liked_id: int) -> LikeResult:
             "DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)",
             (liker_id, liked_id, liked_id, liker_id),
         )
-        await db.execute(
-            "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
-            (liked_id, liker_id),
-        )
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
+                (liked_id, liker_id),
+            )
+        except aiosqlite.IntegrityError:
+            pass
 
         cursor = await db.execute(
             "INSERT OR IGNORE INTO matches (user1_id, user2_id) VALUES (?, ?)",
@@ -844,10 +867,13 @@ async def reject_like(user_id: int, liker_id: int) -> None:
             "DELETE FROM likes WHERE liker_id = ? AND liked_id = ?",
             (liker_id, user_id),
         )
-        await db.execute(
-            "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
-            (user_id, liker_id),
-        )
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
+                (user_id, liker_id),
+            )
+        except aiosqlite.IntegrityError:
+            pass
 
 
 async def block_user(blocker_id: int, blocked_id: int) -> None:
@@ -855,22 +881,26 @@ async def block_user(blocker_id: int, blocked_id: int) -> None:
         return
     u1, u2 = min(blocker_id, blocked_id), max(blocker_id, blocked_id)
     async with transaction():
-        await db.execute(
-            "INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
-            (blocker_id, blocked_id),
-        )
-        await db.execute(
-            "DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)",
-            (blocker_id, blocked_id, blocked_id, blocker_id),
-        )
-        await db.execute(
-            "DELETE FROM matches WHERE user1_id=? AND user2_id=?",
-            (u1, u2),
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
-            (blocker_id, blocked_id),
-        )
+        try:
+            await db.execute(
+                "INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+                (blocker_id, blocked_id),
+            )
+            await db.execute(
+                "DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)",
+                (blocker_id, blocked_id, blocked_id, blocker_id),
+            )
+            await db.execute(
+                "DELETE FROM matches WHERE user1_id=? AND user2_id=?",
+                (u1, u2),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)",
+                (blocker_id, blocked_id),
+            )
+        except aiosqlite.IntegrityError:
+            # blocked_id был удалён ровно во время транзакции
+            pass
 
 
 async def report_exists(reporter_id: int, reported_id: int) -> bool:
@@ -925,7 +955,6 @@ async def add_report(reporter_id: int, reported_id: int, reason: str) -> Optiona
 
 async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
     async with transaction():
-        # Обновляем статус отчёта
         cur = await db.execute(
             """
             UPDATE reports
@@ -943,7 +972,6 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
                 return None
         reported_id = row["reported_id"]
 
-        # Вставляем бан (bans не имеет FK, поэтому работает даже если пользователь удалён)
         await db.execute(
             """
             INSERT INTO bans (user_id, reason) VALUES (?, ?)
@@ -952,7 +980,6 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
             (reported_id, f"Бан по жалобе #{report_id}"),
         )
 
-        # Удаляем лайки и матчи (если пользователь ещё существует)
         await db.execute(
             "DELETE FROM likes WHERE liker_id=? OR liked_id=?",
             (reported_id, reported_id),
@@ -962,7 +989,6 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
             (reported_id, reported_id),
         )
 
-        # Закрываем остальные pending отчёты на этого пользователя
         await db.execute(
             """
             UPDATE reports
@@ -1172,13 +1198,10 @@ async def mark_payment_paid(
     currency: str,
     charge_id: str,
 ) -> PaymentResult:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
     async with db_lock:
         try:
             await db.execute("BEGIN IMMEDIATE")
 
-            # Получаем intent напрямую
             async with db.execute(
                 "SELECT * FROM payment_intents WHERE payload=?",
                 (payload,),
@@ -1190,7 +1213,6 @@ async def mark_payment_paid(
                 return PaymentResult.INVALID
 
             if intent["status"] == "paid":
-                # Проверяем, что это тот же платёж
                 if (
                     intent["user_id"] == user_id
                     and intent["amount"] == amount
@@ -1214,11 +1236,9 @@ async def mark_payment_paid(
                 await db.rollback()
                 return PaymentResult.INVALID
 
-            if intent["expires_at"] and intent["expires_at"] < now:
-                await db.rollback()
-                return PaymentResult.INVALID
+            # Expiry check removed for successful payments.
+            # Telegram already processed the payment, we must record it.
 
-            # Вставляем запись о донате (уникальность charge_id гарантирует идемпотентность)
             await db.execute(
                 """
                 INSERT INTO donations (
@@ -1229,7 +1249,6 @@ async def mark_payment_paid(
                 (user_id, amount, currency, payload, charge_id),
             )
 
-            # Обновляем intent
             cur = await db.execute(
                 """
                 UPDATE payment_intents
@@ -1239,7 +1258,6 @@ async def mark_payment_paid(
                 (charge_id, payload),
             )
             if cur.rowcount != 1:
-                # Это не должно происходить, но на всякий случай откатываем
                 await db.rollback()
                 return PaymentResult.INVALID
 
@@ -1247,15 +1265,38 @@ async def mark_payment_paid(
             return PaymentResult.PAID
 
         except aiosqlite.IntegrityError:
-            # Обрабатываем конфликт уникальности (например, повторный charge_id)
             await db.rollback()
-            # Проверим, не является ли это дубликатом уже обработанного платежа
+            # Конфликт уникальности (например, повторный charge_id)
             async with db.execute(
                 "SELECT * FROM donations WHERE telegram_payment_charge_id=?",
                 (charge_id,),
             ) as cur:
                 existing = await cur.fetchone()
-            if existing and existing["invoice_payload"] == payload:
+            
+            if (
+                existing
+                and existing["invoice_payload"] == payload
+                and existing["user_id"] == user_id
+                and existing["amount"] == amount
+                and existing["currency"] == currency
+            ):
+                # Recovery: если платёж пришёл повторно, но intent почему-то остался pending
+                async with db_lock:
+                    try:
+                        await db.execute("BEGIN IMMEDIATE")
+                        await db.execute(
+                            """
+                            UPDATE payment_intents
+                            SET status='paid',
+                                paid_at=COALESCE(paid_at, CURRENT_TIMESTAMP),
+                                telegram_payment_charge_id=?
+                            WHERE payload=? AND status='pending'
+                            """,
+                            (charge_id, payload),
+                        )
+                        await db.commit()
+                    except Exception:
+                        await db.rollback()
                 return PaymentResult.ALREADY_PAID
             return PaymentResult.INVALID
         except Exception:
@@ -1279,7 +1320,6 @@ class SecurityMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
-        # Платёжные апдейты обрабатываются без ограничений
         if isinstance(event, Message) and event.successful_payment:
             return await handler(event, data)
 
@@ -1294,7 +1334,7 @@ class SecurityMiddleware(BaseMiddleware):
         status = await get_user_status(user.id)
 
         if status["is_banned"]:
-            if first_word == "/delete":
+            if first_word in {"/delete", "/paysupport"}:
                 return await handler(event, data)
             if isinstance(event, Message):
                 await event.answer("Вы заблокированы. Для удаления данных используйте /delete.")
@@ -1305,7 +1345,7 @@ class SecurityMiddleware(BaseMiddleware):
         if status["exists"]:
             rules_ver = status["rules_version"] or 0
             if rules_ver < RULES_VERSION:
-                if isinstance(event, Message) and first_word in ["/start", "/delete"]:
+                if isinstance(event, Message) and first_word in {"/start", "/delete", "/paysupport"}:
                     return await handler(event, data)
                 if isinstance(event, CallbackQuery) and event.data == "agree_rules":
                     return await handler(event, data)
@@ -1395,10 +1435,17 @@ async def send_profile_card(message: Message, user: aiosqlite.Row) -> None:
         await message.answer_photo(photo=user["photo_id"], caption=text, reply_markup=profile_card_keyboard())
     except TelegramBadRequest as exc:
         logger.warning("Failed to send profile card for user %s: %s", user["user_id"], exc)
-        await message.answer(
-            "Не удалось загрузить фото. Обновите его в разделе редактирования.",
-            reply_markup=profile_card_keyboard(),
-        )
+        if is_invalid_photo_error(exc):
+            await deactivate_user_profile(user["user_id"])
+            await message.answer(
+                "Ваше фото недействительно. Анкета деактивирована. Обновите фото в разделе редактирования.",
+                reply_markup=profile_card_keyboard(),
+            )
+        else:
+            await message.answer(
+                "Не удалось загрузить фото. Обновите его в разделе редактирования.",
+                reply_markup=profile_card_keyboard(),
+            )
 
 
 async def handle_stale_callback(callback: CallbackQuery, text: str = "Это действие уже недоступно.") -> bool:
@@ -1736,7 +1783,7 @@ async def cmd_help(message: Message):
 
 @router.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
-    await message.answer(f"По вопросам платежей обратитесь: {SUPPORT_CONTACT}")
+    await message.answer(f"По вопросам платежей обратитесь: {escape(SUPPORT_CONTACT)}")
 
 
 @router.message(Command("unban"))
@@ -1868,7 +1915,6 @@ async def donate_amount(callback: CallbackQuery):
     user_id = callback.from_user.id
     payload = f"donate:{user_id}:{secrets.token_urlsafe(16)}"
 
-    # Подтверждаем callback сразу, чтобы избежать истечения
     await callback.answer()
 
     try:
@@ -1932,7 +1978,6 @@ async def successful_payment_handler(message: Message):
             f"⭐ Спасибо за поддержку! Вы перевели {amount} звёзд. Мы очень ценим ваш вклад! ❤️"
         )
     elif result == PaymentResult.ALREADY_PAID:
-        # Платёж уже обработан ранее – молча подтверждаем
         logger.info("Duplicate successful payment update: %s", charge_id)
     else:
         logger.warning("Invalid payment update: %s", charge_id)
@@ -2415,7 +2460,7 @@ async def admin_ban_user(callback: CallbackQuery):
 
     reported_id = await ban_user_from_report(r_id, callback.from_user.id)
     if not reported_id:
-        return await handle_stale_callback(callback, "Эта жалоба уже обработана или пользователь удалён.")
+        return await handle_stale_callback(callback, "Эта жалоба уже обработана.")
 
     await callback.answer("Пользователь заблокирован. Жалоба закрыта.")
     original = extract_html(callback.message)
@@ -2612,12 +2657,16 @@ async def edit_bio_save(message: Message, state: FSMContext):
 @router.message(EditProfile.photo, F.photo)
 async def edit_photo_save(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
-    if await update_photo(message.from_user.id, photo_id):
+    result = await update_photo(message.from_user.id, photo_id)
+    if result == UpdatePhotoResult.UPDATED:
         await state.clear()
         await send_menu(message, message.from_user.id, "Фотография успешно обновлена. Анкета снова активна.")
-    else:
+    elif result == UpdatePhotoResult.BANNED:
         await state.clear()
         await send_menu(message, message.from_user.id, "Не удалось обновить фото (пользователь заблокирован).")
+    else:
+        await state.clear()
+        await send_menu(message, message.from_user.id, "Не удалось обновить фото (пользователь не найден).")
 
 
 @router.message(EditProfile.photo)
