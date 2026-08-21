@@ -19,9 +19,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     ErrorEvent,
-    InlineKeyboardButton,
     Message,
     TelegramObject,
+    PreCheckoutQuery,
+    SuccessfulPayment,
+    LabeledPrice,
+    InlineKeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -45,8 +48,12 @@ if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID не настроен.")
 
 DB_NAME = os.getenv("DB_NAME", "dating_bot.db")
-DB_SCHEMA_VERSION = 2  # версия схемы БД (для миграций)
-RULES_VERSION = 2      # текущая версия правил
+DB_SCHEMA_VERSION = 3  # увеличили для новых таблиц
+RULES_VERSION = 2
+
+# Для платежей через Telegram Stars
+# provider_token оставляем пустым, currency = "XTR"
+STARS_PROVIDER_TOKEN = ""  # для Stars не требуется
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -71,8 +78,8 @@ MAX_REPORT_LENGTH = 500
 VALID_GENDERS = {"male": "Парень", "female": "Девушка"}
 VALID_SEARCH_GENDERS = {"male": "Парней", "female": "Девушек", "all": "Всех"}
 VALID_MODES = {"local", "global", "likes"}
-ALLOWED_USER_FIELDS = {"name", "age", "gender", "search_gender", "city", "bio", "photo_id", "username"}  # is_active убрали
-KNOWN_COMMANDS = {"/start", "/delete", "/help", "/stats", "/unban"}
+ALLOWED_USER_FIELDS = {"name", "age", "gender", "search_gender", "city", "bio", "photo_id", "username"}
+KNOWN_COMMANDS = {"/start", "/delete", "/help", "/stats", "/unban", "/donate", "/admin_users", "/admin_messages"}
 
 RULES_TEXT = (
     "⚠️ <b>Правила:</b>\n"
@@ -222,6 +229,25 @@ async def init_db() -> None:
         FOREIGN KEY (blocker_id) REFERENCES users(user_id) ON DELETE CASCADE,
         FOREIGN KEY (blocked_id) REFERENCES users(user_id) ON DELETE CASCADE)""")
 
+    # ===== НОВЫЕ ТАБЛИЦЫ ДЛЯ ДОНАТОВ И ЛОГОВ СООБЩЕНИЙ =====
+    await db.execute("""CREATE TABLE IF NOT EXISTS donations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        invoice_payload TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE)""")
+
+    await db.execute("""CREATE TABLE IF NOT EXISTS messages_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        text TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        is_from_bot BOOLEAN DEFAULT 0)""")
+
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages_log(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_time ON messages_log(timestamp DESC)")
+
     await db.execute("CREATE INDEX IF NOT EXISTS idx_users_active_gender ON users(is_active, gender)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_users_gender_city_nocase ON users(gender, city COLLATE NOCASE)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_likes_liked ON likes(liked_id)")
@@ -260,13 +286,15 @@ async def migrate_db():
             await db.execute("ALTER TABLE users ADD COLUMN accepted_rules_version INTEGER")
         await db.execute("PRAGMA user_version = 2")
 
-    # Здесь можно добавить миграции для будущих версий схемы
-    # if version < 3: ...
+    # Миграция для новых таблиц (версия 3)
+    if version < 3:
+        # Таблицы создаются в init_db, но если они уже есть, пропускаем
+        await db.execute("PRAGMA user_version = 3")
 
     await db.commit()
 
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЙ ПОСТРОИТЕЛЬ УСЛОВИЙ ELIGIBILITY (возвращает SQL и параметры)
+# ВСПОМОГАТЕЛЬНЫЙ ПОСТРОИТЕЛЬ УСЛОВИЙ ELIGIBILITY
 # ============================================================
 def build_eligibility_excludes(user_id: int, user_alias: str = "u") -> Tuple[str, List[int]]:
     sql = f"""
@@ -289,8 +317,6 @@ def build_eligibility_excludes(user_id: int, user_alias: str = "u") -> Tuple[str
 # ============================================================
 # ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ
 # ============================================================
-
-# --- get_user_status (исправлен) ---
 async def get_user_status(user_id: int) -> dict:
     async with db_lock:
         async with db.execute(
@@ -350,7 +376,6 @@ async def update_photo(user_id: int, photo_id: str) -> bool:
         return cur.rowcount == 1
 
 async def deactivate_user_profile(user_id: int) -> None:
-    """Деактивирует анкету (например, при невалидном фото)"""
     async with db_lock:
         await db.execute("UPDATE users SET is_active=0 WHERE user_id=?", (user_id,))
         await db.commit()
@@ -365,7 +390,6 @@ async def delete_user(user_id: int) -> None:
     async with transaction():
         await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
-# --- get_likes_count (исправлен) ---
 async def get_likes_count(user_id: int) -> int:
     exclude_sql, exclude_params = build_eligibility_excludes(user_id, "u")
     query = f"""
@@ -498,7 +522,7 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
         await db.execute("DELETE FROM likes WHERE liker_id=? OR liked_id=?", (reported_id, reported_id))
         await db.execute("DELETE FROM matches WHERE user1_id=? OR user2_id=?", (reported_id, reported_id))
 
-        # Закрываем остальные pending reports на этого пользователя
+        # Закрываем остальные pending reports
         await db.execute(
             """
             UPDATE reports
@@ -529,7 +553,6 @@ async def unban_user(user_id: int) -> bool:
         cur = await db.execute("DELETE FROM bans WHERE user_id=?", (user_id,))
         return cur.rowcount > 0
 
-# --- get_random_profile (исправлен) ---
 async def get_random_profile(user_id: int, user_gender: str, search_gender: str, user_city: Optional[str] = None, strict_city: bool = False) -> Optional[aiosqlite.Row]:
     exclude_sql, exclude_params = build_eligibility_excludes(user_id, "u")
 
@@ -570,7 +593,6 @@ async def get_random_profile(user_id: int, user_gender: str, search_gender: str,
         async with db.execute(query, tuple(params)) as cursor:
             return await cursor.fetchone()
 
-# --- get_next_liker (исправлен) ---
 async def get_next_liker(user_id: int) -> Optional[aiosqlite.Row]:
     exclude_sql, exclude_params = build_eligibility_excludes(user_id, "u")
     query = f"""
@@ -613,6 +635,45 @@ async def get_stats() -> Dict[str, int]:
             (SELECT COUNT(*) FROM reports WHERE status = 'pending') AS reports_pending""") as cursor:
             return dict(await cursor.fetchone())
 
+# ===== НОВЫЕ ФУНКЦИИ ДЛЯ ДОНАТОВ И ЛОГОВ =====
+async def log_message(user_id: int, text: str, is_from_bot: bool = False) -> None:
+    async with db_lock:
+        await db.execute(
+            "INSERT INTO messages_log (user_id, text, is_from_bot) VALUES (?, ?, ?)",
+            (user_id, text[:1000], 1 if is_from_bot else 0)
+        )
+        await db.commit()
+
+async def log_donation(user_id: int, amount: int, payload: str) -> None:
+    async with db_lock:
+        await db.execute(
+            "INSERT INTO donations (user_id, amount, invoice_payload) VALUES (?, ?, ?)",
+            (user_id, amount, payload)
+        )
+        await db.commit()
+
+async def get_all_users(limit: int = 20, offset: int = 0) -> List[aiosqlite.Row]:
+    async with db_lock:
+        async with db.execute(
+            """SELECT user_id, name, age, gender, city, is_active, username, created_at
+               FROM users
+               ORDER BY created_at DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset)
+        ) as cursor:
+            return await cursor.fetchall()
+
+async def get_recent_messages(limit: int = 50) -> List[aiosqlite.Row]:
+    async with db_lock:
+        async with db.execute(
+            """SELECT user_id, text, timestamp, is_from_bot
+               FROM messages_log
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            (limit,)
+        ) as cursor:
+            return await cursor.fetchall()
+
 # ============================================================
 # MIDDLEWARE
 # ============================================================
@@ -632,6 +693,10 @@ class SecurityMiddleware(BaseMiddleware):
         if isinstance(event, Message) and event.text:
             first_word = event.text.split()[0].split("@")[0]
 
+        # Логируем все сообщения от пользователей (кроме команд, которые могут содержать sensitive data)
+        if isinstance(event, Message) and event.text and not event.text.startswith('/'):
+            await log_message(user.id, event.text)
+
         status = await get_user_status(user.id)
 
         if status["is_banned"]:
@@ -643,11 +708,9 @@ class SecurityMiddleware(BaseMiddleware):
                 await event.answer("Вы заблокированы.", show_alert=True)
             return
 
-        # Проверка правил только для существующих пользователей
         if status["exists"]:
             rules_ver = status["rules_version"] or 0
             if rules_ver < RULES_VERSION:
-                # Разрешаем только /start, /delete и согласие на правила
                 if isinstance(event, Message) and first_word in ["/start", "/delete"]:
                     return await handler(event, data)
                 if isinstance(event, CallbackQuery) and event.data == "agree_rules":
@@ -708,7 +771,7 @@ async def safe_edit_or_send(callback: CallbackQuery, text: str, reply_markup=Non
             await callback.message.answer(text, reply_markup=reply_markup)
 
 async def send_menu(message: Message, user_id: int, text: str = "Главное меню:") -> None:
-    await message.answer(text, reply_markup=menu_keyboard(await get_likes_count(user_id)))
+    await message.answer(text, reply_markup=menu_keyboard(await get_likes_count(user_id), user_id))
 
 def profile_card_keyboard():
     builder = InlineKeyboardBuilder()
@@ -769,7 +832,7 @@ async def show_next_liker(callback: CallbackQuery, state: FSMContext) -> None:
     while True:
         profile = await get_next_liker(user_id)
         if not profile:
-            await safe_edit_or_send(callback, "Новых лайков нет.", reply_markup=menu_keyboard(await get_likes_count(user_id)))
+            await safe_edit_or_send(callback, "Новых лайков нет.", reply_markup=menu_keyboard(await get_likes_count(user_id), user_id))
             return
         try:
             msg = await callback.message.answer_photo(photo=profile["photo_id"], caption=format_profile(profile, prefix="💌 <b>Вас оценили!</b>\n\n"), reply_markup=profile_like_keyboard(profile["user_id"]))
@@ -818,14 +881,16 @@ def search_gender_keyboard(with_cancel: bool = False):
         builder.adjust(2, 1)
     return builder
 
-def menu_keyboard(likes_count: int = 0):
+def menu_keyboard(likes_count: int = 0, user_id: Optional[int] = None):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔍 Смотреть анкеты", callback_data="search_menu")
     builder.button(text="👤 Моя анкета", callback_data="my_profile")
     builder.button(text="💑 Мои мэтчи", callback_data="my_matches")
     if likes_count > 0:
         builder.button(text=f"💌 Вам понравились: {likes_count}", callback_data="show_likes")
-    builder.adjust(2, 2 if likes_count > 0 else 1)
+    # Кнопка доната
+    builder.button(text="⭐ Поддержать проект", callback_data="donate_menu")
+    builder.adjust(2, 2 if likes_count > 0 else 1, 1)
     return builder.as_markup()
 
 def back_to_menu_keyboard():
@@ -902,6 +967,27 @@ def admin_report_keyboard(report_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
+# ===== НОВЫЕ КЛАВИАТУРЫ ДЛЯ ДОНАТА =====
+def donate_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⭐ 10 звёзд", callback_data="donate_10")
+    builder.button(text="⭐ 25 звёзд", callback_data="donate_25")
+    builder.button(text="⭐ 50 звёзд", callback_data="donate_50")
+    builder.button(text="🔙 Назад", callback_data="menu")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+# ===== НОВЫЕ КЛАВИАТУРЫ ДЛЯ АДМИНА =====
+def admin_users_keyboard(page: int, total_pages: int):
+    builder = InlineKeyboardBuilder()
+    if page > 0:
+        builder.button(text="◀️ Назад", callback_data=f"admin_users_page_{page-1}")
+    if page < total_pages - 1:
+        builder.button(text="Вперёд ▶️", callback_data=f"admin_users_page_{page+1}")
+    builder.button(text="🔙 В меню", callback_data="menu")
+    builder.adjust(2)
+    return builder.as_markup()
+
 async def validate_active_card(callback: CallbackQuery, state: FSMContext, p_id: int, mode: str) -> bool:
     data = await state.get_data()
     if data.get("active_profile_id") != p_id or data.get("active_profile_mode") != mode:
@@ -970,7 +1056,9 @@ async def cmd_help(message: Message):
         "<b>Команды:</b>\n"
         "/start — показать анкету и главное меню\n"
         "/help — эта справка\n"
-        "/delete — удалить анкету и связанные пользовательские данные\n\n" + RULES_TEXT)
+        "/delete — удалить анкету и связанные пользовательские данные\n"
+        "/donate — поддержать проект звёздами\n"
+        "(админские команды: /admin_users, /admin_messages, /stats, /unban)\n\n" + RULES_TEXT)
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message):
@@ -1002,6 +1090,120 @@ async def cmd_stats(message: Message):
         f"⛔ Банов: {s['bans']}\n"
         f"🚩 Жалоб в ожидании: {s['reports_pending']}")
 
+# ============================================================
+# АДМИНСКИЕ КОМАНДЫ ДЛЯ ПРОСМОТРА ПОЛЬЗОВАТЕЛЕЙ И СООБЩЕНИЙ
+# ============================================================
+@router.message(Command("admin_users"))
+async def admin_users(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    page = 0
+    limit = 20
+    users = await get_all_users(limit, page * limit)
+    if not users:
+        await message.answer("Нет зарегистрированных пользователей.")
+        return
+    total = await get_stats()
+    total_users = total['users_total']
+    total_pages = (total_users + limit - 1) // limit
+    text = "👥 <b>Список пользователей (последние зарегистрированные):</b>\n\n"
+    for u in users:
+        text += f"ID: <code>{u['user_id']}</code>, {escape(u['name'])}, {u['age']}, {escape(u['gender'])}, г. {escape(u['city'])}, {'активен' if u['is_active'] else 'неактивен'}\n"
+    text += f"\nСтраница {page+1} из {total_pages}"
+    await message.answer(text, reply_markup=admin_users_keyboard(page, total_pages))
+
+@router.callback_query(F.data.startswith("admin_users_page_"))
+async def admin_users_page(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    page = int(callback.data.split("_")[-1])
+    limit = 20
+    users = await get_all_users(limit, page * limit)
+    if not users:
+        await callback.answer("Нет пользователей на этой странице.", show_alert=True)
+        return
+    total = await get_stats()
+    total_users = total['users_total']
+    total_pages = (total_users + limit - 1) // limit
+    text = "👥 <b>Список пользователей (последние зарегистрированные):</b>\n\n"
+    for u in users:
+        text += f"ID: <code>{u['user_id']}</code>, {escape(u['name'])}, {u['age']}, {escape(u['gender'])}, г. {escape(u['city'])}, {'активен' if u['is_active'] else 'неактивен'}\n"
+    text += f"\nСтраница {page+1} из {total_pages}"
+    await callback.message.edit_text(text, reply_markup=admin_users_keyboard(page, total_pages))
+
+@router.message(Command("admin_messages"))
+async def admin_messages(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msgs = await get_recent_messages(50)
+    if not msgs:
+        await message.answer("Нет сообщений в логе.")
+        return
+    text = "📝 <b>Последние сообщения (до 50):</b>\n\n"
+    for m in msgs:
+        sender = "Бот" if m['is_from_bot'] else f"Пользователь {m['user_id']}"
+        time_str = m['timestamp'][:19].replace('T', ' ')
+        msg_text = escape(m['text'] or '')[:100]
+        text += f"{time_str} | {sender}: {msg_text}\n"
+    await message.answer(text)
+
+# ============================================================
+# ДОНАТЫ (TELEGRAM STARS)
+# ============================================================
+@router.message(Command("donate"))
+async def cmd_donate(message: Message):
+    await message.answer("⭐ Поддержите развитие бота!\nВыберите сумму в звёздах:", reply_markup=donate_keyboard())
+
+@router.callback_query(F.data == "donate_menu")
+async def donate_menu(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text("⭐ Поддержите развитие бота!\nВыберите сумму в звёздах:", reply_markup=donate_keyboard())
+
+@router.callback_query(F.data.startswith("donate_"))
+async def donate_amount(callback: CallbackQuery):
+    amount = int(callback.data.split("_")[1])
+    # Проверяем, что сумма допустима
+    if amount not in (10, 25, 50):
+        await callback.answer("Недопустимая сумма.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    payload = f"donate_{user_id}_{int(time.time())}"
+    prices = [LabeledPrice(label="Поддержка бота", amount=amount)]
+    try:
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="⭐ Поддержка бота знакомств",
+            description="Спасибо за вашу поддержку! Это поможет развитию проекта.",
+            payload=payload,
+            provider_token=STARS_PROVIDER_TOKEN,  # пустая строка для Stars
+            currency="XTR",
+            prices=prices,
+            start_parameter="donate",
+            reply_markup=None,
+        )
+        await callback.answer("Счёт выставлен.")
+    except Exception as e:
+        logger.exception("Ошибка при выставлении счёта: %s", e)
+        await callback.answer("Не удалось создать платёж. Попробуйте позже.", show_alert=True)
+
+@router.pre_checkout_query()
+async def pre_checkout_query_handler(query: PreCheckoutQuery):
+    # Всегда подтверждаем
+    await query.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    payment = message.successful_payment
+    user_id = message.from_user.id
+    amount = payment.total_amount
+    payload = payment.invoice_payload
+    await log_donation(user_id, amount, payload)
+    await message.answer(f"⭐ Спасибо за поддержку! Вы перевели {amount} звёзд. Мы очень ценим ваш вклад! ❤️")
+
+# ============================================================
+# РЕГИСТРАЦИЯ (продолжение)
+# ============================================================
 @router.callback_query(Registration.agreement, F.data == "agree_rules")
 async def registration_agreement(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -1349,17 +1551,17 @@ async def process_report(message: Message, state: FSMContext):
     r_id = await add_report(uid := message.from_user.id, rep_id, reason)
     if r_id is None:
         await state.clear()
-        await message.answer("Не удалось отправить жалобу (пользователь недоступен или вы уже жаловались).", reply_markup=menu_keyboard(await get_likes_count(uid)))
+        await message.answer("Не удалось отправить жалобу (пользователь недоступен или вы уже жаловались).", reply_markup=menu_keyboard(await get_likes_count(uid), uid))
         return
 
     rep_user = await get_user(rep_id)
     if not rep_user:
         await state.clear()
-        await message.answer("Пользователь удалил анкету сразу после жалобы.", reply_markup=menu_keyboard(await get_likes_count(uid)))
+        await message.answer("Пользователь удалил анкету сразу после жалобы.", reply_markup=menu_keyboard(await get_likes_count(uid), uid))
         return
 
     await add_view(uid, rep_id)
-    await message.answer("Жалоба отправлена администрации. Спасибо!", reply_markup=menu_keyboard(await get_likes_count(uid)))
+    await message.answer("Жалоба отправлена администрации. Спасибо!", reply_markup=menu_keyboard(await get_likes_count(uid), uid))
 
     rep_name, rep_un = escape(rep_user["name"]), f"@{escape(rep_user['username'])}" if rep_user["username"] else "нет username"
     text = (f"🚨 <b>Новая жалоба #{r_id}</b>\n\n<b>От кого:</b> {message.from_user.mention_html()} (ID: <code>{uid}</code>)\n"
@@ -1387,7 +1589,7 @@ async def cancel_report(callback: CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except TelegramBadRequest:
         pass
-    await callback.message.answer("Жалоба отменена.", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id)))
+    await callback.message.answer("Жалоба отменена.", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id), callback.from_user.id))
 
 @router.callback_query(F.data.startswith("admin_ban:"))
 async def admin_ban_user(callback: CallbackQuery):
@@ -1510,7 +1712,7 @@ async def edit_search_gender_save(callback: CallbackQuery, state: FSMContext):
     await update_user_field(callback.from_user.id, "search_gender", sg)
     await state.clear()
     await callback.message.edit_text(f"Предпочтения обновлены. Теперь вы ищете: <b>{escape(sg)}</b>.")
-    await callback.message.answer("Главное меню:", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id)))
+    await callback.message.answer("Главное меню:", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id), callback.from_user.id))
 
 @router.message(EditProfile.name, F.text)
 async def edit_name_save(message: Message, state: FSMContext):
@@ -1575,7 +1777,7 @@ async def cancel_editing(callback: CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except TelegramBadRequest:
         pass
-    await callback.message.answer("Действие отменено.", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id)))
+    await callback.message.answer("Действие отменено.", reply_markup=menu_keyboard(await get_likes_count(callback.from_user.id), callback.from_user.id))
 
 @router.callback_query(F.data == "delete_profile")
 async def delete_profile_confirm(callback: CallbackQuery):
@@ -1598,7 +1800,7 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     likes = await get_likes_count(callback.from_user.id)
-    await safe_edit_or_send(callback, "Главное меню:", reply_markup=menu_keyboard(likes))
+    await safe_edit_or_send(callback, "Главное меню:", reply_markup=menu_keyboard(likes, callback.from_user.id))
 
 @router.callback_query()
 async def unknown_callback(callback: CallbackQuery):
