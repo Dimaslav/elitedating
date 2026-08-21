@@ -47,13 +47,10 @@ if ADMIN_ID <= 0:
     raise RuntimeError("ADMIN_ID не настроен.")
 
 DB_NAME = os.getenv("DB_NAME", "dating_bot.db")
-DB_SCHEMA_VERSION = 6  # Бамп версии: фикс схемы reports
+DB_SCHEMA_VERSION = 6
 RULES_VERSION = 2
 
 STARS_PROVIDER_TOKEN = ""
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT")
-if not SUPPORT_CONTACT:
-    raise RuntimeError("SUPPORT_CONTACT не настроен в .env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -271,7 +268,6 @@ async def _run_migration(target_version: int, migration_coro) -> None:
 
 
 async def _migrate_v1() -> None:
-    # Создание базовых таблиц
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -550,13 +546,10 @@ async def _migrate_v6() -> None:
         """
     )
 
-    # Проверяем, существует ли таблица reports (на случай, если кто-то стартует с v4)
     async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reports'") as cursor:
         if await cursor.fetchone():
-            # Удаляем записи с NULL, которые могли появиться из-за старого ON DELETE SET NULL
             await db.execute("DELETE FROM reports WHERE reporter_id IS NULL OR reported_id IS NULL")
             
-            # Копируем данные, заполняя snapshots из существующих users
             await db.execute(
                 """
                 INSERT INTO reports_new (
@@ -899,7 +892,6 @@ async def block_user(blocker_id: int, blocked_id: int) -> None:
                 (blocker_id, blocked_id),
             )
         except aiosqlite.IntegrityError:
-            # blocked_id был удалён ровно во время транзакции
             pass
 
 
@@ -1236,9 +1228,6 @@ async def mark_payment_paid(
                 await db.rollback()
                 return PaymentResult.INVALID
 
-            # Expiry check removed for successful payments.
-            # Telegram already processed the payment, we must record it.
-
             await db.execute(
                 """
                 INSERT INTO donations (
@@ -1280,23 +1269,28 @@ async def mark_payment_paid(
                 and existing["amount"] == amount
                 and existing["currency"] == currency
             ):
-                # Recovery: если платёж пришёл повторно, но intent почему-то остался pending
-                async with db_lock:
-                    try:
-                        await db.execute("BEGIN IMMEDIATE")
-                        await db.execute(
-                            """
-                            UPDATE payment_intents
-                            SET status='paid',
-                                paid_at=COALESCE(paid_at, CURRENT_TIMESTAMP),
-                                telegram_payment_charge_id=?
-                            WHERE payload=? AND status='pending'
-                            """,
-                            (charge_id, payload),
-                        )
-                        await db.commit()
-                    except Exception:
-                        await db.rollback()
+                # Recovery: если платёж пришёл повторно, но intent почему-то остался pending.
+                # Мы уже внутри `async with db_lock:`, поэтому не нужно захватывать лок повторно.
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    await db.execute(
+                        """
+                        UPDATE payment_intents
+                        SET status='paid',
+                            paid_at=COALESCE(paid_at, CURRENT_TIMESTAMP),
+                            telegram_payment_charge_id=?
+                        WHERE payload=? AND status='pending'
+                        """,
+                        (charge_id, payload),
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    logger.exception(
+                        "Не удалось восстановить payment intent %s",
+                        payload,
+                    )
+                    raise
                 return PaymentResult.ALREADY_PAID
             return PaymentResult.INVALID
         except Exception:
@@ -1694,6 +1688,15 @@ def admin_users_keyboard(page: int, total_pages: int):
     return builder.as_markup()
 
 
+def payment_support_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✉️ Написать в поддержку",
+        url=f"tg://user?id={ADMIN_ID}",
+    )
+    return builder.as_markup()
+
+
 async def validate_active_card(callback: CallbackQuery, state: FSMContext, p_id: int, mode: str) -> bool:
     data = await state.get_data()
     if data.get("active_profile_id") != p_id or data.get("active_profile_mode") != mode:
@@ -1783,7 +1786,10 @@ async def cmd_help(message: Message):
 
 @router.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
-    await message.answer(f"По вопросам платежей обратитесь: {escape(SUPPORT_CONTACT)}")
+    await message.answer(
+        "По вопросам платежей напишите администратору:",
+        reply_markup=payment_support_keyboard(),
+    )
 
 
 @router.message(Command("unban"))
