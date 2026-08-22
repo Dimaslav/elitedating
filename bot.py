@@ -46,10 +46,7 @@ if ADMIN_ID <= 0:
 DB_NAME = os.getenv("DB_NAME", "dating_bot.db")
 RULES_VERSION = 2
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -73,10 +70,18 @@ MAX_REPORT_LENGTH = 500
 VALID_GENDERS = {"male": "Парень", "female": "Девушка"}
 VALID_SEARCH_GENDERS = {"male": "Парней", "female": "Девушек", "all": "Всех"}
 VALID_MODES = {"local", "global", "likes"}
+
 ALLOWED_USER_FIELDS = {
-    "name", "age", "gender", "search_gender", "city",
-    "bio", "photo_id", "username", "is_active"
+    "name",
+    "age",
+    "gender",
+    "search_gender",
+    "city",
+    "bio",
+    "photo_id",
+    "username",
 }
+
 KNOWN_COMMANDS = {"/start", "/delete", "/help", "/stats", "/unban"}
 
 RULES_TEXT = (
@@ -308,25 +313,22 @@ async def migrate_db():
     await db.commit()
 
 async def get_user_status(user_id: int) -> dict:
-    if db is None:
-        return {"is_banned": False, "rules_version": None}
-
     async with db_lock:
         async with db.execute(
-            "SELECT 1 FROM bans WHERE user_id = ? LIMIT 1",
-            (user_id,),
-        ) as cursor:
-            is_banned = await cursor.fetchone() is not None
-
-        async with db.execute(
-            "SELECT accepted_rules_version FROM users WHERE user_id = ?",
-            (user_id,),
+            """
+            SELECT
+                EXISTS(SELECT 1 FROM bans WHERE user_id=?) AS is_banned,
+                EXISTS(SELECT 1 FROM users WHERE user_id=?) AS user_exists,
+                (SELECT accepted_rules_version FROM users WHERE user_id=?) AS accepted_rules_version
+            """,
+            (user_id, user_id, user_id),
         ) as cursor:
             row = await cursor.fetchone()
 
     return {
-        "is_banned": is_banned,
-        "rules_version": row["accepted_rules_version"] if row else None,
+        "is_banned": bool(row["is_banned"]),
+        "exists": bool(row["user_exists"]),
+        "rules_version": row["accepted_rules_version"],
     }
 
 async def check_ban(user_id: int) -> bool:
@@ -373,8 +375,17 @@ async def add_user_to_db(
                 is_active=1,
                 accepted_rules_version=excluded.accepted_rules_version""",
             (
-                user_id, name, age, gender, search_gender,
-                city, bio, photo_id, username, accepted_rules_at, RULES_VERSION
+                user_id,
+                name,
+                age,
+                gender,
+                search_gender,
+                city,
+                bio,
+                photo_id,
+                username,
+                accepted_rules_at,
+                RULES_VERSION,
             ),
         )
     return True
@@ -384,6 +395,11 @@ async def update_user_field(user_id: int, field: str, value: Any) -> None:
         raise ValueError(f"Недопустимое поле: {field}")
     async with db_lock:
         await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+        await db.commit()
+
+async def deactivate_user_profile(user_id: int) -> None:
+    async with db_lock:
+        await db.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
         await db.commit()
 
 async def update_photo(user_id: int, photo_id: str) -> bool:
@@ -406,44 +422,59 @@ async def delete_user(user_id: int) -> None:
     async with transaction():
         await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
-def build_eligibility_excludes(user_alias: str = "u", target_field: str = "user_id") -> str:
-    return f"""
+def build_eligibility_excludes(
+    user_id: int,
+    user_alias: str = "u",
+) -> Tuple[str, list[int]]:
+    sql = f"""
         AND NOT EXISTS (
             SELECT 1 FROM views v
-            WHERE v.viewer_id = ? AND v.viewed_id = {user_alias}.{target_field}
+            WHERE v.viewer_id=?
+              AND v.viewed_id={user_alias}.user_id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM likes l
+            WHERE l.liker_id=?
+              AND l.liked_id={user_alias}.user_id
         )
         AND NOT EXISTS (
             SELECT 1 FROM blocks b
-            WHERE b.blocker_id = ? AND b.blocked_id = {user_alias}.{target_field}
+            WHERE b.blocker_id=?
+              AND b.blocked_id={user_alias}.user_id
         )
         AND NOT EXISTS (
             SELECT 1 FROM blocks b
-            WHERE b.blocker_id = {user_alias}.{target_field} AND b.blocked_id = ?
+            WHERE b.blocker_id={user_alias}.user_id
+              AND b.blocked_id=?
         )
         AND NOT EXISTS (
             SELECT 1 FROM bans b
-            WHERE b.user_id = {user_alias}.{target_field}
+            WHERE b.user_id={user_alias}.user_id
         )
         AND NOT EXISTS (
             SELECT 1 FROM matches m
-            WHERE (m.user1_id = ? AND m.user2_id = {user_alias}.{target_field})
-               OR (m.user2_id = ? AND m.user1_id = {user_alias}.{target_field})
+            WHERE
+                (m.user1_id=? AND m.user2_id={user_alias}.user_id)
+                OR
+                (m.user2_id=? AND m.user1_id={user_alias}.user_id)
         )
         AND NOT EXISTS (
             SELECT 1 FROM reports r
-            WHERE r.reporter_id = ? AND r.reported_id = {user_alias}.{target_field}
+            WHERE r.reporter_id=?
+              AND r.reported_id={user_alias}.user_id
         )
     """
+    return sql, [user_id] * 7
 
 async def get_likes_count(user_id: int) -> int:
+    exclude_sql, exclude_params = build_eligibility_excludes(user_id, "u")
     query = f"""
         SELECT COUNT(*) FROM likes AS l
         JOIN users AS u ON u.user_id = l.liker_id
         WHERE l.liked_id = ? AND u.is_active = 1
-        {build_eligibility_excludes('u', 'user_id')}
+        {exclude_sql}
     """
-    # 1 параметр на l.liked_id + 6 параметров из build_eligibility_excludes = 7
-    params = [user_id, user_id, user_id, user_id, user_id, user_id, user_id]
+    params = [user_id, *exclude_params]
     async with db_lock:
         async with db.execute(query, tuple(params)) as cursor:
             return (await cursor.fetchone())[0]
@@ -515,18 +546,37 @@ async def reject_like(user_id: int, liker_id: int) -> None:
         await db.execute("DELETE FROM likes WHERE liker_id = ? AND liked_id = ?", (liker_id, user_id))
         await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (user_id, liker_id))
 
-async def block_user(blocker_id: int, blocked_id: int) -> None:
+async def block_user(blocker_id: int, blocked_id: int) -> bool:
     if blocker_id == blocked_id:
-        return
-    u1, u2 = min(blocker_id, blocked_id), max(blocker_id, blocked_id)
+        return False
+
+    u1, u2 = sorted((blocker_id, blocked_id))
+
     async with transaction():
-        await db.execute("INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)", (blocker_id, blocked_id))
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE user_id IN (?, ?)",
+            (blocker_id, blocked_id),
+        ) as cur:
+            count = (await cur.fetchone())[0]
+
+        if count != 2:
+            return False
+
         await db.execute(
-            "DELETE FROM likes WHERE (liker_id=? AND liked_id=?) OR (liker_id=? AND liked_id=?)",
+            "INSERT OR IGNORE INTO blocks (blocker_id, blocked_id) VALUES (?, ?)",
+            (blocker_id, blocked_id),
+        )
+        await db.execute(
+            """
+            DELETE FROM likes
+            WHERE (liker_id=? AND liked_id=?)
+               OR (liker_id=? AND liked_id=?)
+            """,
             (blocker_id, blocked_id, blocked_id, blocker_id),
         )
         await db.execute("DELETE FROM matches WHERE user1_id=? AND user2_id=?", (u1, u2))
         await db.execute("INSERT OR IGNORE INTO views (viewer_id, viewed_id) VALUES (?, ?)", (blocker_id, blocked_id))
+        return True
 
 async def report_exists(reporter_id: int, reported_id: int) -> bool:
     async with db_lock:
@@ -583,6 +633,21 @@ async def ban_user_from_report(report_id: int, admin_id: int) -> Optional[int]:
         )
         await db.execute("DELETE FROM likes WHERE liker_id=? OR liked_id=?", (reported_id, reported_id))
         await db.execute("DELETE FROM matches WHERE user1_id=? OR user2_id=?", (reported_id, reported_id))
+
+        await db.execute(
+            """
+            UPDATE reports
+            SET status='accepted',
+                reviewed_by=?,
+                reviewed_at=CURRENT_TIMESTAMP,
+                resolution='already_banned'
+            WHERE reported_id=?
+              AND id<>?
+              AND status='pending'
+            """,
+            (admin_id, reported_id, report_id),
+        )
+
         return reported_id
 
 async def reject_report(report_id: int, admin_id: int) -> bool:
@@ -607,13 +672,13 @@ async def get_random_profile(
     user_city: Optional[str] = None,
     strict_city: bool = False,
 ) -> Optional[aiosqlite.Row]:
+    exclude_sql, exclude_params = build_eligibility_excludes(user_id, "u")
     query = f"""
         SELECT * FROM users u
         WHERE u.user_id != ? AND u.is_active = 1
-        {build_eligibility_excludes('u', 'user_id')}
+        {exclude_sql}
     """
-    # 1 параметр на u.user_id != ? + 6 параметров из build_eligibility_excludes = 7
-    params = [user_id, user_id, user_id, user_id, user_id, user_id, user_id]
+    params = [user_id, *exclude_params]
 
     if search_gender != "Всех":
         g_filter = {"Парней": "Парень", "Девушек": "Девушка"}.get(search_gender)
@@ -645,14 +710,15 @@ async def get_random_profile(
             return await cursor.fetchone()
 
 async def get_next_liker(user_id: int) -> Optional[aiosqlite.Row]:
+    exclude_sql, exclude_params = build_eligibility_excludes(user_id, "u")
     query = f"""
         SELECT u.* FROM users AS u
         JOIN likes AS l ON u.user_id = l.liker_id
         WHERE l.liked_id = ? AND u.is_active = 1
-        {build_eligibility_excludes('u', 'user_id')}
+        {exclude_sql}
         ORDER BY l.created_at DESC LIMIT 1
     """
-    params = [user_id, user_id, user_id, user_id, user_id, user_id, user_id]
+    params = [user_id, *exclude_params]
     async with db_lock:
         async with db.execute(query, tuple(params)) as cursor:
             return await cursor.fetchone()
@@ -676,16 +742,27 @@ async def get_matches(user_id: int) -> list:
 
 async def get_stats() -> Dict[str, int]:
     async with db_lock:
-        async with db.execute("""SELECT
-            (SELECT COUNT(*) FROM users) AS users_total,
-            (SELECT COUNT(*) FROM users WHERE is_active = 1) AS users_active,
-            (SELECT COUNT(*) FROM likes) AS likes,
-            (SELECT COUNT(*) FROM matches) AS matches,
-            (SELECT COUNT(*) FROM views) AS views,
-            (SELECT COUNT(*) FROM blocks) AS blocks,
-            (SELECT COUNT(*) FROM bans) AS bans,
-            (SELECT COUNT(*) FROM reports WHERE status = 'pending') AS reports_pending
-        """) as cursor:
+        async with db.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM users) AS users_total,
+                (
+                    SELECT COUNT(*)
+                    FROM users u
+                    WHERE u.is_active = 1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM bans b
+                          WHERE b.user_id = u.user_id
+                      )
+                ) AS users_active,
+                (SELECT COUNT(*) FROM likes) AS likes,
+                (SELECT COUNT(*) FROM matches) AS matches,
+                (SELECT COUNT(*) FROM views) AS views,
+                (SELECT COUNT(*) FROM blocks) AS blocks,
+                (SELECT COUNT(*) FROM bans) AS bans,
+                (SELECT COUNT(*) FROM reports WHERE status = 'pending') AS reports_pending
+            """
+        ) as cursor:
             return dict(await cursor.fetchone())
 
 # ============================================================
@@ -724,12 +801,13 @@ class SecurityMiddleware(BaseMiddleware):
                 await event.answer("Вы заблокированы.", show_alert=True)
             return
 
-        rules_ver = status["rules_version"]
-        if rules_ver is not None and rules_ver < RULES_VERSION:
-            if isinstance(event, Message) and first_word in ["/start", "/delete"]:
+        if status["exists"] and (status["rules_version"] or 0) < RULES_VERSION:
+            if isinstance(event, Message) and first_word in {"/start", "/delete"}:
                 return await handler(event, data)
+
             if isinstance(event, CallbackQuery) and event.data == "agree_rules":
                 return await handler(event, data)
+
             if isinstance(event, CallbackQuery):
                 await event.answer("Правила сервиса обновились. Напишите /start.", show_alert=True)
             elif isinstance(event, Message):
@@ -808,7 +886,11 @@ async def send_profile_card(message: Message, user: aiosqlite.Row) -> None:
     try:
         await message.answer_photo(photo=user["photo_id"], caption=text, reply_markup=profile_card_keyboard())
     except TelegramBadRequest:
-        await message.answer("Не удалось загрузить фото. Обновите его в разделе редактирования.", reply_markup=profile_card_keyboard())
+        await deactivate_user_profile(user["user_id"])
+        await message.answer(
+            "Не удалось загрузить фото. Анкета временно деактивирована. Обновите фото в разделе редактирования.",
+            reply_markup=profile_card_keyboard(),
+        )
 
 async def handle_stale_callback(callback: CallbackQuery, text: str = "Это действие уже недоступно.") -> bool:
     await callback.answer(text, show_alert=True)
@@ -858,7 +940,7 @@ async def show_profile(callback: CallbackQuery, state: FSMContext, mode: str = "
             return
         except TelegramBadRequest as exc:
             if "wrong file identifier" in str(exc).lower() or "PHOTO_INVALID" in str(exc).upper():
-                await update_user_field(profile["user_id"], "is_active", 0)
+                await deactivate_user_profile(profile["user_id"])
                 continue
             await safe_edit_or_send(callback, "Не удалось показать анкету. Попробуйте позже.")
             return
@@ -888,7 +970,7 @@ async def show_next_liker(callback: CallbackQuery, state: FSMContext) -> None:
             return
         except TelegramBadRequest as exc:
             if "wrong file identifier" in str(exc).lower() or "PHOTO_INVALID" in str(exc).upper():
-                await update_user_field(profile["user_id"], "is_active", 0)
+                await deactivate_user_profile(profile["user_id"])
                 continue
             await safe_edit_or_send(callback, "Не удалось показать анкету.")
             return
@@ -1410,7 +1492,10 @@ async def block_profile(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Анкета недоступна.", show_alert=True)
             return
 
-        await block_user(uid, blocked_id)
+        if not await block_user(uid, blocked_id):
+            await callback.answer("Не удалось заблокировать пользователя.", show_alert=True)
+            return
+
         await callback.answer("Пользователь заблокирован. Все лайки и мэтчи удалены.")
         await delete_callback_message(callback)
         await show_next(callback, state, mode)
