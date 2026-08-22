@@ -46,7 +46,10 @@ if ADMIN_ID <= 0:
 DB_NAME = os.getenv("DB_NAME", "dating_bot.db")
 RULES_VERSION = 2
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -131,6 +134,18 @@ def parse_profile_callback(data: Optional[str], expected_action: str) -> Optiona
     if action != expected_action or p_id <= 0 or mode not in VALID_MODES:
         return None
     return p_id, mode
+
+def is_invalid_photo_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "wrong file identifier",
+            "wrong file_id",
+            "photo_invalid",
+            "file is too old",
+        )
+    )
 
 # ============================================================
 # PER-USER ACTION LOCKS
@@ -279,10 +294,17 @@ async def init_db() -> None:
     await db.execute("CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_matches_user2 ON matches(user2_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_reports_status_created ON reports(status, timestamp)")
-    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique ON reports(reporter_id, reported_id) WHERE status = 'pending'")
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique "
+        "ON reports(reporter_id, reported_id) WHERE status = 'pending'"
+    )
     await db.commit()
 
     await migrate_db()
+
+    async with db.execute("PRAGMA user_version") as cursor:
+        version = (await cursor.fetchone())[0]
+    logger.info("DB path=%s | user_version=%s", os.path.abspath(DB_NAME), version)
     logger.info("База данных успешно инициализирована.")
 
 async def migrate_db():
@@ -298,7 +320,10 @@ async def migrate_db():
             await db.execute("ALTER TABLE reports ADD COLUMN reviewed_at DATETIME")
             await db.execute("ALTER TABLE reports ADD COLUMN resolution TEXT")
         await db.execute("DROP INDEX IF EXISTS idx_reports_unique")
-        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique ON reports(reporter_id, reported_id) WHERE status = 'pending'")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_pending_unique "
+            "ON reports(reporter_id, reported_id) WHERE status = 'pending'"
+        )
         await db.execute("PRAGMA user_version = 1")
 
     if version < 2:
@@ -357,6 +382,7 @@ async def add_user_to_db(
         async with db.execute("SELECT 1 FROM bans WHERE user_id=?", (user_id,)) as cur:
             if await cur.fetchone():
                 return False
+
         await db.execute(
             """INSERT INTO users (
                 user_id, name, age, gender, search_gender, city, bio, photo_id,
@@ -771,7 +797,7 @@ async def get_stats() -> Dict[str, int]:
 
 class SecurityMiddleware(BaseMiddleware):
     def __init__(self):
-        self.last_action = {}
+        self.last_action: Dict[Tuple[int, str], float] = {}
         self.cooldown_callback = 0.4
         self.cooldown_message = 0.7
         self.cooldown_command = 2.0
@@ -785,6 +811,14 @@ class SecurityMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if not user:
             return await handler(event, data)
+
+        fsm: Optional[FSMContext] = data.get("state")
+        current_state = None
+        if fsm is not None:
+            try:
+                current_state = await fsm.get_state()
+            except Exception:
+                current_state = None
 
         first_word: Optional[str] = None
         if isinstance(event, Message) and event.text:
@@ -804,32 +838,64 @@ class SecurityMiddleware(BaseMiddleware):
         if status["exists"] and (status["rules_version"] or 0) < RULES_VERSION:
             if isinstance(event, Message) and first_word in {"/start", "/delete"}:
                 return await handler(event, data)
-
             if isinstance(event, CallbackQuery) and event.data == "agree_rules":
                 return await handler(event, data)
-
             if isinstance(event, CallbackQuery):
                 await event.answer("Правила сервиса обновились. Напишите /start.", show_alert=True)
             elif isinstance(event, Message):
                 await event.answer("Правила сервиса обновились. Пожалуйста, напишите /start.")
             return
 
-        is_command = first_word in KNOWN_COMMANDS
-        cooldown = self.cooldown_command if is_command else (
-            self.cooldown_callback if isinstance(event, CallbackQuery) else self.cooldown_message
-        )
+        bypass_states = {
+            Registration.agreement.state,
+            Registration.name.state,
+            Registration.age.state,
+            Registration.gender.state,
+            Registration.search_gender.state,
+            Registration.city.state,
+            Registration.bio.state,
+            Registration.photo.state,
+            EditProfile.name.state,
+            EditProfile.age.state,
+            EditProfile.search_gender.state,
+            EditProfile.city.state,
+            EditProfile.bio.state,
+            EditProfile.photo.state,
+            Report.reason.state,
+        }
 
+        if current_state in bypass_states:
+            return await handler(event, data)
+
+        is_command = first_word in KNOWN_COMMANDS
+        if is_command:
+            action_type = "command"
+            cooldown = self.cooldown_command
+        elif isinstance(event, CallbackQuery):
+            action_type = "callback"
+            cooldown = self.cooldown_callback
+        else:
+            action_type = "message"
+            cooldown = self.cooldown_message
+
+        key = (user.id, action_type)
         now = time.monotonic()
-        if now - self.last_action.get(user.id, 0) < cooldown:
+
+        if now - self.last_action.get(key, 0) < cooldown:
             if isinstance(event, CallbackQuery):
                 await event.answer("Не так быстро. Подождите немного.")
             elif isinstance(event, Message):
                 await event.answer("Не так быстро. Подождите немного.")
             return
 
-        self.last_action[user.id] = now
+        self.last_action[key] = now
+
         if len(self.last_action) > 10000:
-            self.last_action = {k: v for k, v in self.last_action.items() if now - v < 3600}
+            self.last_action = {
+                k: v for k, v in self.last_action.items()
+                if now - v < 3600
+            }
+
         return await handler(event, data)
 
 security_mw = SecurityMiddleware()
@@ -885,12 +951,19 @@ async def send_profile_card(message: Message, user: aiosqlite.Row) -> None:
     )
     try:
         await message.answer_photo(photo=user["photo_id"], caption=text, reply_markup=profile_card_keyboard())
-    except TelegramBadRequest:
-        await deactivate_user_profile(user["user_id"])
-        await message.answer(
-            "Не удалось загрузить фото. Анкета временно деактивирована. Обновите фото в разделе редактирования.",
-            reply_markup=profile_card_keyboard(),
-        )
+    except TelegramBadRequest as exc:
+        logger.warning("Failed to send own profile photo for user=%s: %s", user["user_id"], exc)
+        if is_invalid_photo_error(exc):
+            await deactivate_user_profile(user["user_id"])
+            await message.answer(
+                "Ваше фото недействительно. Анкета временно деактивирована. Обновите фото в разделе редактирования.",
+                reply_markup=profile_card_keyboard(),
+            )
+        else:
+            await message.answer(
+                "Не удалось загрузить фото. Попробуйте позже или обновите его в разделе редактирования.",
+                reply_markup=profile_card_keyboard(),
+            )
 
 async def handle_stale_callback(callback: CallbackQuery, text: str = "Это действие уже недоступно.") -> bool:
     await callback.answer(text, show_alert=True)
@@ -939,7 +1012,7 @@ async def show_profile(callback: CallbackQuery, state: FSMContext, mode: str = "
             )
             return
         except TelegramBadRequest as exc:
-            if "wrong file identifier" in str(exc).lower() or "PHOTO_INVALID" in str(exc).upper():
+            if is_invalid_photo_error(exc):
                 await deactivate_user_profile(profile["user_id"])
                 continue
             await safe_edit_or_send(callback, "Не удалось показать анкету. Попробуйте позже.")
@@ -969,7 +1042,7 @@ async def show_next_liker(callback: CallbackQuery, state: FSMContext) -> None:
             )
             return
         except TelegramBadRequest as exc:
-            if "wrong file identifier" in str(exc).lower() or "PHOTO_INVALID" in str(exc).upper():
+            if is_invalid_photo_error(exc):
                 await deactivate_user_profile(profile["user_id"])
                 continue
             await safe_edit_or_send(callback, "Не удалось показать анкету.")
@@ -1127,24 +1200,41 @@ async def error_handler(event: ErrorEvent):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    logger.info(
+        "COMMAND /start | user_id=%s username=%r",
+        message.from_user.id,
+        message.from_user.username,
+    )
+
     await state.clear()
     user_id = message.from_user.id
     user = await get_user(user_id)
+
     if user:
         if user["username"] != message.from_user.username:
             await update_user_field(user_id, "username", message.from_user.username)
+
         if not user["accepted_rules_at"] or (user["accepted_rules_version"] or 0) < RULES_VERSION:
             await state.set_state(Registration.agreement)
             await state.update_data(reaccept=True)
-            await message.answer("Правила сервиса обновились. Пожалуйста, ознакомьтесь и подтвердите их:", reply_markup=rules_keyboard())
+            logger.info("FSM | user=%s -> %s", user_id, await state.get_state())
+            await message.answer(
+                "Правила сервиса обновились. Пожалуйста, ознакомьтесь и подтвердите их:",
+                reply_markup=rules_keyboard(),
+            )
             return
+
         await message.answer("С возвращением! Вот ваша анкета:")
         await send_profile_card(message, user)
         await send_menu(message, user_id)
         return
 
     await state.set_state(Registration.agreement)
-    await message.answer("Добро пожаловать в бот знакомств!\n\n" + RULES_TEXT, reply_markup=rules_keyboard())
+    logger.info("FSM | user=%s -> %s", user_id, await state.get_state())
+    await message.answer(
+        "Добро пожаловать в бот знакомств!\n\n" + RULES_TEXT,
+        reply_markup=rules_keyboard(),
+    )
 
 @router.message(Command("delete"))
 async def cmd_delete(message: Message, state: FSMContext):
@@ -1203,6 +1293,7 @@ async def cmd_stats(message: Message):
 async def registration_agreement(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     accepted_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     if (await state.get_data()).get("reaccept"):
         await set_rules_accepted(callback.from_user.id, accepted_at)
         await state.clear()
@@ -1212,18 +1303,37 @@ async def registration_agreement(callback: CallbackQuery, state: FSMContext):
             await send_profile_card(callback.message, user)
         await send_menu(callback.message, callback.from_user.id)
         return
+
     await state.set_state(Registration.name)
+    logger.info("FSM | user=%s -> %s", callback.from_user.id, await state.get_state())
     await state.update_data(accepted_rules_at=accepted_at)
-    await callback.message.edit_text(f"Как вас зовут?\nВведите имя от {MIN_NAME_LENGTH} до {MAX_NAME_LENGTH} символов.")
+    await callback.message.edit_text(
+        f"Как вас зовут?\nВведите имя от {MIN_NAME_LENGTH} до {MAX_NAME_LENGTH} символов."
+    )
 
 @router.message(Registration.name, F.text)
 async def registration_name(message: Message, state: FSMContext):
+    logger.info(
+        "REGISTRATION NAME | user=%s | state=%s | text=%r",
+        message.from_user.id,
+        await state.get_state(),
+        message.text,
+    )
+
     name = validate_text(message.text, MIN_NAME_LENGTH, MAX_NAME_LENGTH)
     if not name:
         await message.answer(f"Имя должно содержать от {MIN_NAME_LENGTH} до {MAX_NAME_LENGTH} символов.")
         return
+
     await state.update_data(name=name)
     await state.set_state(Registration.age)
+
+    logger.info(
+        "FSM CHANGED | user=%s | new_state=%s",
+        message.from_user.id,
+        await state.get_state(),
+    )
+
     await message.answer(f"Сколько вам лет?\nВведите число от {MIN_AGE} до {MAX_AGE}.")
 
 @router.message(Registration.age, F.text)
@@ -1273,7 +1383,10 @@ async def registration_city(message: Message, state: FSMContext):
         return
     await state.update_data(city=" ".join(city.strip().split()))
     await state.set_state(Registration.bio)
-    await message.answer(f"Город: <b>{escape(city)}</b>\n\nРасскажите немного о себе: от {MIN_BIO_LENGTH} до {MAX_BIO_LENGTH} символов.")
+    await message.answer(
+        f"Город: <b>{escape(city)}</b>\n\n"
+        f"Расскажите немного о себе: от {MIN_BIO_LENGTH} до {MAX_BIO_LENGTH} символов."
+    )
 
 @router.message(Registration.bio, F.text)
 async def registration_bio(message: Message, state: FSMContext):
@@ -1317,6 +1430,19 @@ async def registration_photo_invalid(message: Message):
 ))
 async def text_required_invalid(message: Message):
     await message.answer("Пожалуйста, отправьте значение текстом.")
+
+@router.message()
+async def unknown_message(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    logger.warning(
+        "UNHANDLED MESSAGE | user_id=%s | state=%r | text=%r",
+        message.from_user.id if message.from_user else None,
+        current_state,
+        message.text,
+    )
+    await message.answer(
+        "Сообщение не распознано. Если вы начали регистрацию — попробуйте ещё раз или напишите /start."
+    )
 
 # ============================================================
 # ПОИСК АНКЕТ И ВЗАИМОДЕЙСТВИЯ
