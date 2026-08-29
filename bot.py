@@ -1424,26 +1424,6 @@ async def registration_photo(message: Message, state: FSMContext):
 async def registration_photo_invalid(message: Message):
     await message.answer("Пожалуйста, отправьте изображение именно как фотографию.")
 
-@router.message(StateFilter(
-    Registration.name, Registration.age, Registration.city, Registration.bio,
-    EditProfile.name, EditProfile.age, EditProfile.city, EditProfile.bio,
-))
-async def text_required_invalid(message: Message):
-    await message.answer("Пожалуйста, отправьте значение текстом.")
-
-@router.message()
-async def unknown_message(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    logger.warning(
-        "UNHANDLED MESSAGE | user_id=%s | state=%r | text=%r",
-        message.from_user.id if message.from_user else None,
-        current_state,
-        message.text,
-    )
-    await message.answer(
-        "Сообщение не распознано. Если вы начали регистрацию — попробуйте ещё раз или напишите /start."
-    )
-
 # ============================================================
 # ПОИСК АНКЕТ И ВЗАИМОДЕЙСТВИЯ
 # ============================================================
@@ -1979,6 +1959,40 @@ async def back_to_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query()
 async def unknown_callback(callback: CallbackQuery):
     await callback.answer("Эта кнопка устарела. Откройте меню заново.", show_alert=True)
+
+# ============================================================
+# КАТЧ-ОЛЛ ОБРАБОТЧИКИ СООБЩЕНИЙ
+#
+# ВАЖНО: эти обработчики должны быть зарегистрированы САМЫМИ ПОСЛЕДНИМИ
+# среди всех @router.message(...). aiogram проверяет message-хендлеры
+# в порядке их регистрации и вызывает первый подошедший по фильтрам.
+# `unknown_message` вообще не имеет фильтров, поэтому если поместить его
+# (или менее строгий `text_required_invalid`) раньше — они "перехватят"
+# все последующие сообщения, и обработчики вроде process_report,
+# edit_name_save, edit_age_save, edit_city_save, edit_bio_save,
+# edit_photo_save никогда не будут вызваны. Именно так было в исходной
+# версии файла — это и было исправлено переносом блока сюда.
+# ============================================================
+
+@router.message(StateFilter(
+    Registration.name, Registration.age, Registration.city, Registration.bio,
+    EditProfile.name, EditProfile.age, EditProfile.city, EditProfile.bio,
+))
+async def text_required_invalid(message: Message):
+    await message.answer("Пожалуйста, отправьте значение текстом.")
+
+@router.message()
+async def unknown_message(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    logger.warning(
+        "UNHANDLED MESSAGE | user_id=%s | state=%r | text=%r",
+        message.from_user.id if message.from_user else None,
+        current_state,
+        message.text,
+    )
+    await message.answer(
+        "Сообщение не распознано. Если вы начали регистрацию — попробуйте ещё раз или напишите /start."
+    )
 
 # ============================================================
 # ЗАПУСК
